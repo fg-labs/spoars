@@ -1,0 +1,24 @@
+[package]
+name = "spoars"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Faithful native-Rust reimplementation of the spoa partial order alignment library"
+readme = "README.md"
+repository = "https://github.com/fg-labs/spoars"
+homepage = "https://github.com/fg-labs/spoars"
+documentation = "https://docs.rs/spoars"
+keywords = ["bioinformatics", "poa", "alignment", "consensus", "msa"]
+categories = ["science", "algorithms"]
+# Keep the published crate lean and self-contained: the C++ differential oracle
+# and the pinned spoa submodule are development/test-only (see THIRD-PARTY.md) and
+# must not ship in the crate tarball.
+exclude = [
+    "third_party/**",
+    "oracle/**",
+    ".github/**",
+    "scripts/**",
+    "RELAY.md",
+]
+

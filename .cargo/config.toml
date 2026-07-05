@@ -1,0 +1,12 @@
+[alias]
+# CI / local convenience aliases (mirrors the fg-labs house style so `cargo ci-*`
+# means the same thing everywhere). `ci-lint` uses `-D warnings` rather than the
+# full `clippy::pedantic` set: this crate is hand-tuned SIMD/numeric code whose
+# `#[inline(always)]` kernels and range-guaranteed integer casts deliberately
+# trip several pedantic lints (`inline_always`, `cast_possible_truncation`, ...),
+# so `-D warnings` is the meaningful bar here (and matches the project's Rust
+# convention). Doctests are run separately (`cargo test --doc`) since `nextest`
+# does not execute them.
+ci-test = "nextest run --locked --no-tests=pass"
+ci-fmt = "fmt -- --check"
+ci-lint = "clippy --all-targets -- -D warnings"

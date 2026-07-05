@@ -1,0 +1,15 @@
+/target
+/oracle/build
+/.superpowers/
+
+# Python bindings (spoars-py) build/dev artifacts. pixi.lock IS tracked.
+/spoars-py/target
+.pixi/
+dist/
+*.so
+*.pyc
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
