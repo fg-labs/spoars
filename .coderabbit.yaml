@@ -1,0 +1,10 @@
+# CodeRabbit configuration.
+# https://docs.coderabbit.ai/getting-started/configure-coderabbit
+#
+# `third_party/spoa` is a verbatim upstream submodule (the reference C++ library
+# spoars ports, used only by the differential oracle). It is not our code to fix
+# — issues belong upstream in rvaser/spoa — so exclude it from review to avoid
+# re-flagging third-party code every pass.
+reviews:
+  path_filters:
+    - "!third_party/spoa/**"
