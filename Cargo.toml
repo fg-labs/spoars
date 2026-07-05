@@ -22,8 +22,28 @@ exclude = [
     "RELAY.md",
 ]
 
+[[bin]]
+name = "spoars"
+path = "src/bin/spoars.rs"
+# The CLI is the only thing that reads FASTA/FASTQ files, so it is the only
+# thing that needs `needletail`. Gating it behind the `cli` feature keeps the
+# library (and any downstream consumer, e.g. the Python bindings) free of
+# needletail and its compression C dependencies.
+required-features = ["cli"]
+
+[features]
+# On by default so `cargo build`/`cargo install` still produce the CLI; a
+# library-only consumer can opt out with `default-features = false`.
+default = ["cli"]
+cli = ["dep:needletail"]
+
+[dependencies]
+# Optional: only pulled in by the `cli` feature (used solely by src/bin/spoars.rs).
+needletail = { version = "0.7", optional = true }
 
 [dev-dependencies]
+# Always available to tests (tests/support/generators.rs reads FASTA/FASTQ),
+# independent of whether the `cli` feature is enabled.
 needletail = "0.7"
 proptest = "1"
 serde = { version = "1", features = ["derive"] }
