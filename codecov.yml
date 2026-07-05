@@ -1,0 +1,16 @@
+# Codecov configuration.
+#
+# Coverage statuses are reported but non-blocking (informational). Several code
+# paths — notably the `spoars` CLI — are exercised by spawning the compiled
+# binary as a subprocess (see tests/cli_parity.rs), and `cargo-llvm-cov` does
+# not capture coverage from spawned processes, so the reported percentage
+# understates real test coverage. Keeping the statuses informational surfaces
+# the numbers on pull requests without ever failing the check.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
