@@ -9,8 +9,10 @@
 //! and its bit-identical [`simd`] counterpart.
 
 mod backtrack;
+pub mod simd;
 pub mod sisd;
 
+pub use simd::SimdEngine;
 pub use sisd::SisdEngine;
 
 use crate::graph::{Graph, GraphError, NodeId};

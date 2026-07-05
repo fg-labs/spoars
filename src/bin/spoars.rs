@@ -9,14 +9,35 @@
 //! (`main.cpp:242-244`, `results.erase(results.begin())`); and a sequence's name (for GFA `P`-line
 //! headers and MSA/consensus row labels) is the first whitespace-delimited token of its
 //! FASTA/FASTQ record id (biosoup's `Sequence` semantics), not the full header line.
+//!
+//! Aligns with the dispatching [`SimdEngine`] (best available ISA at runtime, SISD fallback) by
+//! default; set `SPOARS_FORCE_SISD=1` to force the scalar [`SisdEngine`] instead (a hidden,
+//! undocumented-in-`--help` escape hatch for differential debugging — see
+//! [`should_force_sisd`]).
 
 use std::io::Write;
 use std::process::ExitCode;
 
 use needletail::parse_fastx_file;
 
-use spoars::align::{AlignmentEngine, AlignmentType, Scoring, SisdEngine};
+use spoars::align::{AlignmentEngine, AlignmentType, Scoring, SimdEngine, SisdEngine};
 use spoars::graph::Graph;
+
+/// Name of the hidden escape-hatch environment variable that forces the CLI to align with the
+/// scalar [`SisdEngine`] instead of the default (dispatching) [`SimdEngine`]. Not documented in
+/// `--help` (a low-profile dev knob, not a user-facing feature); useful for differential debugging
+/// (comparing SIMD vs scalar output/timing on a real input) and as a safety valve should a
+/// vectorized kernel ever be suspected of diverging from the oracle-validated `SisdEngine` on some
+/// host's ISA.
+const FORCE_SISD_ENV: &str = "SPOARS_FORCE_SISD";
+
+/// Decides whether [`FORCE_SISD_ENV`]'s raw value (`None` if the variable is unset) should force
+/// the scalar engine. Any value other than unset, empty, or `"0"` forces SISD (so `=1`, `=true`,
+/// `=yes` all work) — a permissive boolean parse, deliberately more lenient than requiring an
+/// exact `"1"`, since this is a low-stakes dev knob rather than a validated CLI option.
+fn should_force_sisd(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if !v.is_empty() && v != "0")
+}
 
 /// Parsed CLI options, with spoa's exact defaults (`main.cpp:207-220`).
 struct Options {
@@ -476,7 +497,12 @@ fn run(opts: Options) -> ExitCode {
         }
     };
 
-    let mut engine = SisdEngine::new(alignment_type, scoring);
+    let force_sisd = should_force_sisd(std::env::var(FORCE_SISD_ENV).ok().as_deref());
+    let mut engine: Box<dyn AlignmentEngine> = if force_sisd {
+        Box::new(SisdEngine::new(alignment_type, scoring))
+    } else {
+        Box::new(SimdEngine::new(alignment_type, scoring))
+    };
     let mut graph = Graph::new();
     let mut is_reversed: Vec<bool> = Vec::new();
 
@@ -582,6 +608,21 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use spoars::graph::Graph;
+
+    #[test]
+    fn should_force_sisd_treats_unset_empty_and_zero_as_false() {
+        assert!(!should_force_sisd(None));
+        assert!(!should_force_sisd(Some("")));
+        assert!(!should_force_sisd(Some("0")));
+    }
+
+    #[test]
+    fn should_force_sisd_treats_any_other_value_as_true() {
+        assert!(should_force_sisd(Some("1")));
+        assert!(should_force_sisd(Some("true")));
+        assert!(should_force_sisd(Some("yes")));
+        assert!(should_force_sisd(Some("anything")));
+    }
 
     #[test]
     fn reverse_complement_reverses_and_complements_preserving_case() {

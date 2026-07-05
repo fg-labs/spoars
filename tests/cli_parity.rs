@@ -21,14 +21,25 @@ use support::oracle::{run_oracle, AlignType, OracleCase, OracleResult};
 /// Path (relative to the crate root) to the upstream FASTQ fixture the CLI parity tests drive.
 const DATA: &str = "third_party/spoa/test/data/sample.fastq.gz";
 
-/// Runs the built `spoars` binary with `args`, from the crate root (so relative paths like
-/// [`DATA`] resolve the same way they do for `cargo test`).
-fn run_bin(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_spoars"))
-        .args(args)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+/// Runs the built `spoars` binary with `args` and `envs` (additional environment variables laid
+/// over the inherited environment), from the crate root (so relative paths like [`DATA`] resolve
+/// the same way they do for `cargo test`).
+fn run_bin_with_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_spoars"));
+    command.args(args).current_dir(env!("CARGO_MANIFEST_DIR"));
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command
         .output()
         .expect("failed to execute the spoars binary")
+}
+
+/// Runs the built `spoars` binary with `args`, from the crate root (so relative paths like
+/// [`DATA`] resolve the same way they do for `cargo test`). Uses the default (dispatching
+/// `SimdEngine`) alignment engine — i.e. NEON on this Mac.
+fn run_bin(args: &[&str]) -> Output {
+    run_bin_with_env(args, &[])
 }
 
 /// Runs the built `spoars` binary and asserts it exited successfully, returning its stdout as a
@@ -38,6 +49,19 @@ fn run_bin_ok(args: &[&str]) -> String {
     assert!(
         output.status.success(),
         "spoars {args:?} exited with {}: stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("spoars stdout was not valid UTF-8")
+}
+
+/// Like [`run_bin_ok`], but sets `SPOARS_FORCE_SISD=1` so the CLI aligns with the scalar
+/// `SisdEngine` instead of the default dispatching `SimdEngine`.
+fn run_bin_ok_forced_sisd(args: &[&str]) -> String {
+    let output = run_bin_with_env(args, &[("SPOARS_FORCE_SISD", "1")]);
+    assert!(
+        output.status.success(),
+        "spoars {args:?} (SPOARS_FORCE_SISD=1) exited with {}: stderr={}",
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
@@ -203,4 +227,96 @@ fn cli_score_i8_wrap_does_not_error() {
          stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+// --- SimdEngine-vs-forced-SISD CLI parity (SIMD kernels plan Task 16) ---
+//
+// The CLI now defaults to the dispatching `SimdEngine` (NEON on this Mac) rather than hard-coding
+// `SisdEngine`; `SPOARS_FORCE_SISD=1` is the hidden escape hatch back to the scalar engine (see
+// `src/bin/spoars.rs`'s `should_force_sisd`). Each test below computes the oracle's expected
+// output once, then asserts BOTH the default (SimdEngine/NEON) and forced-SISD CLI runs match it
+// AND match each other byte-for-byte — proving the NEON-backed CLI is bit-exact with both the
+// scalar engine and the offline C++ oracle, across the `-r` result modes (0/1/3), an alignment
+// type (`-l 1`), and a non-default score set.
+
+/// Asserts `args` produces byte-identical stdout via the default (SimdEngine/NEON) CLI, the
+/// forced-SISD CLI, and (both equal to) `expected`.
+fn assert_simd_matches_sisd_and_expected(args: &[&str], expected: &str) {
+    let stdout_simd = run_bin_ok(args);
+    let stdout_sisd = run_bin_ok_forced_sisd(args);
+
+    assert_eq!(
+        stdout_simd, expected,
+        "spoars {args:?} (default SimdEngine/NEON) must match the oracle"
+    );
+    assert_eq!(
+        stdout_sisd, expected,
+        "spoars {args:?} (SPOARS_FORCE_SISD=1) must match the oracle"
+    );
+    assert_eq!(
+        stdout_simd, stdout_sisd,
+        "spoars {args:?}: SimdEngine (NEON) and forced-SISD output must be byte-identical"
+    );
+}
+
+#[test]
+fn cli_r0_consensus_simd_matches_sisd_and_oracle() {
+    let (case, _names) = base_case(AlignType::Sw);
+    let exp = &run_oracle(std::slice::from_ref(&case))[0];
+    let expected = format!(
+        ">Consensus LN:i:{}\n{}\n",
+        exp.consensus.len(),
+        exp.consensus
+    );
+
+    assert_simd_matches_sisd_and_expected(&["-r", "0", DATA], &expected);
+}
+
+#[test]
+fn cli_r1_msa_simd_matches_sisd_and_oracle() {
+    let (case, names) = base_case(AlignType::Sw);
+    let exp = &run_oracle(std::slice::from_ref(&case))[0];
+
+    let mut expected = String::new();
+    for (i, row) in exp.msa.iter().enumerate() {
+        expected.push_str(&format!(">{}\n{row}\n", names[i]));
+    }
+
+    assert_simd_matches_sisd_and_expected(&["-r", "1", DATA], &expected);
+}
+
+#[test]
+fn cli_r3_gfa_simd_matches_sisd_and_oracle() {
+    let (case, _names) = base_case(AlignType::Sw);
+    let exp = &run_oracle(std::slice::from_ref(&case))[0];
+
+    assert_simd_matches_sisd_and_expected(&["-r", "3", DATA], &exp.gfa);
+}
+
+#[test]
+fn cli_l1_nw_consensus_simd_matches_sisd_and_oracle() {
+    let (case, _names) = base_case(AlignType::Nw);
+    let exp = &run_oracle(std::slice::from_ref(&case))[0];
+    let expected = format!(
+        ">Consensus LN:i:{}\n{}\n",
+        exp.consensus.len(),
+        exp.consensus
+    );
+
+    assert_simd_matches_sisd_and_expected(&["-l", "1", "-r", "0", DATA], &expected);
+}
+
+#[test]
+fn cli_r0_consensus_simd_matches_sisd_and_oracle_with_non_default_scores() {
+    let (mut case, _names) = base_case(AlignType::Sw);
+    case.m = 3;
+    case.n = -2;
+    let exp = &run_oracle(std::slice::from_ref(&case))[0];
+    let expected = format!(
+        ">Consensus LN:i:{}\n{}\n",
+        exp.consensus.len(),
+        exp.consensus
+    );
+
+    assert_simd_matches_sisd_and_expected(&["-m", "3", "-n", "-2", "-r", "0", DATA], &expected);
 }
