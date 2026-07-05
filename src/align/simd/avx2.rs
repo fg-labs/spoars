@@ -55,8 +55,9 @@
 
 use super::lanes::Simd;
 use core::arch::x86_64::{
-    __m256i, _mm256_add_epi16, _mm256_add_epi32, _mm256_alignr_epi8, _mm256_loadu_si256,
-    _mm256_max_epi16, _mm256_max_epi32, _mm256_min_epi16, _mm256_min_epi32, _mm256_or_si256,
+    __m256i, _mm256_add_epi16, _mm256_add_epi32, _mm256_alignr_epi8, _mm256_castsi256_si128,
+    _mm256_cvtepi16_epi32, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_max_epi16,
+    _mm256_max_epi32, _mm256_min_epi16, _mm256_min_epi32, _mm256_or_si256,
     _mm256_permute2x128_si256, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_srli_si256,
     _mm256_storeu_si256, _mm256_sub_epi16, _mm256_sub_epi32,
 };
@@ -77,6 +78,7 @@ const NEG_INF_I32: i32 = i32::MIN + 1024;
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn or_si(a: __m256i, b: __m256i) -> __m256i {
     _mm256_or_si256(a, b)
 }
@@ -89,6 +91,7 @@ unsafe fn or_si(a: __m256i, b: __m256i) -> __m256i {
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn slli_si<const N: i32>(a: __m256i) -> __m256i {
     // `{low = 0, high = a_low}`: the source of the bytes that spill up across the lane boundary.
     let spill = _mm256_permute2x128_si256::<0x08>(a, a);
@@ -110,6 +113,7 @@ unsafe fn slli_si<const N: i32>(a: __m256i) -> __m256i {
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn srli_si<const N: i32>(a: __m256i) -> __m256i {
     // `{low = a_high, high = 0}`: bit 7 of `0x81` zeroes the high lane so no garbage carries in.
     let hi_to_lo = _mm256_permute2x128_si256::<0x81>(a, a);
@@ -131,6 +135,7 @@ unsafe fn srli_si<const N: i32>(a: __m256i) -> __m256i {
 /// # Safety
 /// Caller must guarantee AVX2 is available AND that `src` points to at least 32 readable bytes.
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn loadu(src: *const u8) -> __m256i {
     _mm256_loadu_si256(src.cast::<__m256i>())
 }
@@ -141,8 +146,26 @@ unsafe fn loadu(src: *const u8) -> __m256i {
 /// # Safety
 /// Caller must guarantee AVX2 is available AND that `dst` points to at least 32 writable bytes.
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn storeu(dst: *mut u8, v: __m256i) {
     _mm256_storeu_si256(dst.cast::<__m256i>(), v);
+}
+
+/// Sign-extends the 16 packed `i16` lanes of `v` to `i32` and stores them contiguously to the 16
+/// `i32` slots at `dst` (64 bytes). Widens each 128-bit half with `_mm256_cvtepi16_epi32` (the low
+/// half via `_mm256_castsi256_si128`, the high half via `_mm256_extracti128_si256::<1>`) and stores
+/// the two resulting 8×`i32` vectors.
+///
+/// # Safety
+/// Caller must guarantee AVX2 is available AND that `dst` points to at least 16 writable `i32`
+/// (64 bytes).
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn store_widen_i16(dst: *mut i32, v: __m256i) {
+    let lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(v));
+    let hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(v));
+    _mm256_storeu_si256(dst.cast::<__m256i>(), lo);
+    _mm256_storeu_si256(dst.add(8).cast::<__m256i>(), hi);
 }
 
 // ---- Avx2I16: 16 × i16 -----------------------------------------------------------------------
@@ -157,6 +180,7 @@ pub(crate) struct Avx2I16;
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn add16(a: __m256i, b: __m256i) -> __m256i {
     _mm256_add_epi16(a, b)
 }
@@ -166,6 +190,7 @@ unsafe fn add16(a: __m256i, b: __m256i) -> __m256i {
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn sub16(a: __m256i, b: __m256i) -> __m256i {
     _mm256_sub_epi16(a, b)
 }
@@ -174,7 +199,11 @@ unsafe fn sub16(a: __m256i, b: __m256i) -> __m256i {
 ///
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
+// The `min` trait op is test-only: the DP fill maximizes score (so it uses `max`, never `min`),
+// so this faithful-port helper is dead in non-test builds.
+#[allow(dead_code)]
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn min16(a: __m256i, b: __m256i) -> __m256i {
     _mm256_min_epi16(a, b)
 }
@@ -184,6 +213,7 @@ unsafe fn min16(a: __m256i, b: __m256i) -> __m256i {
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn max16(a: __m256i, b: __m256i) -> __m256i {
     _mm256_max_epi16(a, b)
 }
@@ -193,6 +223,7 @@ unsafe fn max16(a: __m256i, b: __m256i) -> __m256i {
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn set1_16(value: i16) -> __m256i {
     _mm256_set1_epi16(value)
 }
@@ -207,36 +238,43 @@ impl Simd for Avx2I16 {
     const RSS: i32 = 32 - size_of::<i16>() as i32; // 30
     const NEG_INF: i16 = NEG_INF_I16;
 
+    #[inline(always)]
     fn splat(value: i16) -> __m256i {
         // SAFETY: only reached after `is_x86_feature_detected!("avx2")` (see module Safety note).
         unsafe { set1_16(value) }
     }
 
+    #[inline(always)]
     fn add(a: __m256i, b: __m256i) -> __m256i {
         // SAFETY: see `splat`. Non-saturating `_mm256_add_epi16` per the plan's Global Constraints.
         unsafe { add16(a, b) }
     }
 
+    #[inline(always)]
     fn sub(a: __m256i, b: __m256i) -> __m256i {
         // SAFETY: see `splat`. Non-saturating `_mm256_sub_epi16`.
         unsafe { sub16(a, b) }
     }
 
+    #[inline(always)]
     fn min(a: __m256i, b: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { min16(a, b) }
     }
 
+    #[inline(always)]
     fn max(a: __m256i, b: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { max16(a, b) }
     }
 
+    #[inline(always)]
     fn or(a: __m256i, b: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { or_si(a, b) }
     }
 
+    #[inline(always)]
     fn loadu(src: &[i16]) -> __m256i {
         debug_assert!(src.len() >= Self::LANES);
         // SAFETY: see `splat`; the `debug_assert` (and the trait's documented precondition)
@@ -244,34 +282,47 @@ impl Simd for Avx2I16 {
         unsafe { loadu(src.as_ptr().cast::<u8>()) }
     }
 
+    #[inline(always)]
     fn storeu(v: __m256i, dst: &mut [i16]) {
         debug_assert!(dst.len() >= Self::LANES);
         // SAFETY: see `loadu`, mirrored for the 32-byte write.
         unsafe { storeu(dst.as_mut_ptr().cast::<u8>(), v) }
     }
 
+    #[inline(always)]
+    fn store_widened_i32(v: __m256i, dst: &mut [i32]) {
+        debug_assert!(dst.len() >= Self::LANES);
+        // SAFETY: see `splat`; the `debug_assert` guarantees `dst` covers the 16 `i32` written.
+        unsafe { store_widen_i16(dst.as_mut_ptr(), v) }
+    }
+
+    #[inline(always)]
     fn slli<const N: i32>(v: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { slli_si::<N>(v) }
     }
 
+    #[inline(always)]
     fn srli<const N: i32>(v: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { srli_si::<N>(v) }
     }
 
     /// Diagonal shift by `LSS = 2` bytes (one `i16` lane), the literal for this width.
+    #[inline(always)]
     fn slli_one_lane(v: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { slli_si::<2>(v) }
     }
 
     /// Carry shift by `RSS = 30` bytes (isolate lane 15 into lane 0), the literal for this width.
+    #[inline(always)]
     fn srli_top_lane(v: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { srli_si::<30>(v) }
     }
 
+    #[inline(always)]
     fn horizontal_max(v: __m256i) -> i16 {
         let mut lanes = [0i16; 16];
         Self::storeu(v, &mut lanes);
@@ -282,6 +333,7 @@ impl Simd for Avx2I16 {
     /// Hand-unrolled 4-step ladder with byte-shifts `[2, 4, 8, 16]` (`impl:84-92`). Each step is the
     /// shared [`Simd::prefix_max_step`] with that step's literal shift constant. The `16` step is
     /// the one that exercises the cross-128-bit-lane path (`slli_si`'s `N >= 16` arm).
+    #[inline(always)]
     fn prefix_max(v: __m256i, penalties: &[__m256i], masks: &[__m256i]) -> __m256i {
         debug_assert!(penalties.len() >= Self::LOG_LANES as usize);
         debug_assert!(masks.len() >= Self::LOG_LANES as usize);
@@ -305,6 +357,7 @@ pub(crate) struct Avx2I32;
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn add32(a: __m256i, b: __m256i) -> __m256i {
     _mm256_add_epi32(a, b)
 }
@@ -314,6 +367,7 @@ unsafe fn add32(a: __m256i, b: __m256i) -> __m256i {
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn sub32(a: __m256i, b: __m256i) -> __m256i {
     _mm256_sub_epi32(a, b)
 }
@@ -322,7 +376,10 @@ unsafe fn sub32(a: __m256i, b: __m256i) -> __m256i {
 ///
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
+// Test-only trait op; see the note on `min16` above.
+#[allow(dead_code)]
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn min32(a: __m256i, b: __m256i) -> __m256i {
     _mm256_min_epi32(a, b)
 }
@@ -332,6 +389,7 @@ unsafe fn min32(a: __m256i, b: __m256i) -> __m256i {
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn max32(a: __m256i, b: __m256i) -> __m256i {
     _mm256_max_epi32(a, b)
 }
@@ -341,6 +399,7 @@ unsafe fn max32(a: __m256i, b: __m256i) -> __m256i {
 /// # Safety
 /// Caller must guarantee AVX2 is available (see the module-level Safety note).
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn set1_32(value: i32) -> __m256i {
     _mm256_set1_epi32(value)
 }
@@ -355,36 +414,43 @@ impl Simd for Avx2I32 {
     const RSS: i32 = 32 - size_of::<i32>() as i32; // 28
     const NEG_INF: i32 = NEG_INF_I32;
 
+    #[inline(always)]
     fn splat(value: i32) -> __m256i {
         // SAFETY: only reached after `is_x86_feature_detected!("avx2")` (see module Safety note).
         unsafe { set1_32(value) }
     }
 
+    #[inline(always)]
     fn add(a: __m256i, b: __m256i) -> __m256i {
         // SAFETY: see `splat`. Non-saturating `_mm256_add_epi32` per the plan's Global Constraints.
         unsafe { add32(a, b) }
     }
 
+    #[inline(always)]
     fn sub(a: __m256i, b: __m256i) -> __m256i {
         // SAFETY: see `splat`. Non-saturating `_mm256_sub_epi32`.
         unsafe { sub32(a, b) }
     }
 
+    #[inline(always)]
     fn min(a: __m256i, b: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { min32(a, b) }
     }
 
+    #[inline(always)]
     fn max(a: __m256i, b: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { max32(a, b) }
     }
 
+    #[inline(always)]
     fn or(a: __m256i, b: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { or_si(a, b) }
     }
 
+    #[inline(always)]
     fn loadu(src: &[i32]) -> __m256i {
         debug_assert!(src.len() >= Self::LANES);
         // SAFETY: see `splat`; the `debug_assert` (and the trait's documented precondition)
@@ -392,34 +458,48 @@ impl Simd for Avx2I32 {
         unsafe { loadu(src.as_ptr().cast::<u8>()) }
     }
 
+    #[inline(always)]
     fn storeu(v: __m256i, dst: &mut [i32]) {
         debug_assert!(dst.len() >= Self::LANES);
         // SAFETY: see `loadu`, mirrored for the 32-byte write.
         unsafe { storeu(dst.as_mut_ptr().cast::<u8>(), v) }
     }
 
+    #[inline(always)]
+    fn store_widened_i32(v: __m256i, dst: &mut [i32]) {
+        debug_assert!(dst.len() >= Self::LANES);
+        // Elem is already `i32`; the "widen" is a plain 32-byte store.
+        // SAFETY: see `loadu`, mirrored for the 32-byte write.
+        unsafe { storeu(dst.as_mut_ptr().cast::<u8>(), v) }
+    }
+
+    #[inline(always)]
     fn slli<const N: i32>(v: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { slli_si::<N>(v) }
     }
 
+    #[inline(always)]
     fn srli<const N: i32>(v: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { srli_si::<N>(v) }
     }
 
     /// Diagonal shift by `LSS = 4` bytes (one `i32` lane), the literal for this width.
+    #[inline(always)]
     fn slli_one_lane(v: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { slli_si::<4>(v) }
     }
 
     /// Carry shift by `RSS = 28` bytes (isolate lane 7 into lane 0), the literal for this width.
+    #[inline(always)]
     fn srli_top_lane(v: __m256i) -> __m256i {
         // SAFETY: see `splat`.
         unsafe { srli_si::<28>(v) }
     }
 
+    #[inline(always)]
     fn horizontal_max(v: __m256i) -> i32 {
         let mut lanes = [0i32; 8];
         Self::storeu(v, &mut lanes);
@@ -430,6 +510,7 @@ impl Simd for Avx2I32 {
     /// Hand-unrolled 3-step ladder with byte-shifts `[4, 8, 16]` (`impl:120-127`). Each step is the
     /// shared [`Simd::prefix_max_step`] with that step's literal shift constant. The `16` step is
     /// the one that exercises the cross-128-bit-lane path (`slli_si`'s `N >= 16` arm).
+    #[inline(always)]
     fn prefix_max(v: __m256i, penalties: &[__m256i], masks: &[__m256i]) -> __m256i {
         debug_assert!(penalties.len() >= Self::LOG_LANES as usize);
         debug_assert!(masks.len() >= Self::LOG_LANES as usize);
@@ -630,6 +711,48 @@ mod tests {
         assert_eq!(unpack16(Avx2I16::slli_one_lane(v)), shift_left_i16(&a, 2));
         // srli_top_lane = shift right by RSS = 30 bytes (lane 15 into lane 0).
         assert_eq!(unpack16(Avx2I16::srli_top_lane(v)), shift_right_i16(&a, 30));
+    }
+
+    #[test]
+    fn i16_store_widened_i32_sign_extends_all_lanes() {
+        if !avx2_available() {
+            return;
+        }
+        let src = [
+            -5i16,
+            2,
+            -9,
+            11,
+            i16::MIN,
+            i16::MAX,
+            0,
+            -1,
+            -4,
+            2,
+            -1,
+            9,
+            -8,
+            21,
+            -5,
+            7,
+        ];
+        let v = Avx2I16::loadu(&src);
+        let mut dst = [0i32; 16];
+        Avx2I16::store_widened_i32(v, &mut dst);
+        let expected: [i32; 16] = std::array::from_fn(|k| i32::from(src[k]));
+        assert_eq!(dst, expected);
+    }
+
+    #[test]
+    fn i32_store_widened_i32_is_a_plain_store() {
+        if !avx2_available() {
+            return;
+        }
+        let src = [-5i32, 123_456, i32::MIN, i32::MAX, 0, -1, 7, -100_000];
+        let v = Avx2I32::loadu(&src);
+        let mut dst = [0i32; 8];
+        Avx2I32::store_widened_i32(v, &mut dst);
+        assert_eq!(dst, src);
     }
 
     #[test]

@@ -38,9 +38,9 @@
 use super::lanes::Simd;
 use core::arch::aarch64::{
     int16x8_t, int32x4_t, int8x16_t, vaddq_s16, vaddq_s32, vdupq_n_s16, vdupq_n_s32, vdupq_n_s8,
-    vextq_s8, vld1q_s16, vld1q_s32, vmaxq_s16, vmaxq_s32, vminq_s16, vminq_s32, vorrq_s16,
-    vorrq_s32, vreinterpretq_s16_s8, vreinterpretq_s32_s8, vreinterpretq_s8_s16,
-    vreinterpretq_s8_s32, vst1q_s16, vst1q_s32, vsubq_s16, vsubq_s32,
+    vextq_s8, vget_high_s16, vget_low_s16, vld1q_s16, vld1q_s32, vmaxq_s16, vmaxq_s32, vminq_s16,
+    vminq_s32, vmovl_s16, vorrq_s16, vorrq_s32, vreinterpretq_s16_s8, vreinterpretq_s32_s8,
+    vreinterpretq_s8_s16, vreinterpretq_s8_s32, vst1q_s16, vst1q_s32, vsubq_s16, vsubq_s32,
 };
 
 /// `i16::MIN + 1024`, this backend's `kNegativeInfinity` (see [`Simd::NEG_INF`]).
@@ -67,6 +67,7 @@ const NEG_INF_I32: i32 = i32::MIN + 1024;
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn byte_shift_left<const N: i32>(v: int8x16_t) -> int8x16_t {
     let z = vdupq_n_s8(0);
     match N {
@@ -99,6 +100,7 @@ unsafe fn byte_shift_left<const N: i32>(v: int8x16_t) -> int8x16_t {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn byte_shift_right<const N: i32>(v: int8x16_t) -> int8x16_t {
     let z = vdupq_n_s8(0);
     match N {
@@ -134,6 +136,7 @@ pub(crate) struct NeonI16;
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn add16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
     vaddq_s16(a, b)
 }
@@ -143,6 +146,7 @@ unsafe fn add16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn sub16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
     vsubq_s16(a, b)
 }
@@ -151,7 +155,11 @@ unsafe fn sub16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
 ///
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
+// The `min` trait op is test-only: the DP fill maximizes score (so it uses `max`, never `min`),
+// so this faithful-port helper is dead in non-test builds.
+#[allow(dead_code)]
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn min16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
     vminq_s16(a, b)
 }
@@ -161,6 +169,7 @@ unsafe fn min16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn max16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
     vmaxq_s16(a, b)
 }
@@ -170,6 +179,7 @@ unsafe fn max16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn or16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
     vorrq_s16(a, b)
 }
@@ -179,6 +189,7 @@ unsafe fn or16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn set1_16(value: i16) -> int16x8_t {
     vdupq_n_s16(value)
 }
@@ -189,6 +200,7 @@ unsafe fn set1_16(value: i16) -> int16x8_t {
 /// # Safety
 /// Caller must guarantee NEON is available AND that `src` points to at least 8 readable `i16`.
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn loadu16(src: *const i16) -> int16x8_t {
     vld1q_s16(src)
 }
@@ -198,8 +210,22 @@ unsafe fn loadu16(src: *const i16) -> int16x8_t {
 /// # Safety
 /// Caller must guarantee NEON is available AND that `dst` points to at least 8 writable `i16`.
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn storeu16(dst: *mut i16, v: int16x8_t) {
     vst1q_s16(dst, v);
+}
+
+/// Sign-extends the 8 packed `i16` lanes of `v` to `i32` and stores them contiguously to the 8
+/// `i32` slots at `dst`. Widens each half with `vmovl_s16` (`vget_low_s16`/`vget_high_s16`) and
+/// stores the two resulting 4×`i32` vectors with `vst1q_s32`.
+///
+/// # Safety
+/// Caller must guarantee NEON is available AND that `dst` points to at least 8 writable `i32`.
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn store_widen_i16(dst: *mut i32, v: int16x8_t) {
+    vst1q_s32(dst, vmovl_s16(vget_low_s16(v)));
+    vst1q_s32(dst.add(4), vmovl_s16(vget_high_s16(v)));
 }
 
 /// Byte-shift-left of an `i16` register by `N` bytes (via the shared [`byte_shift_left`] over an
@@ -208,6 +234,7 @@ unsafe fn storeu16(dst: *mut i16, v: int16x8_t) {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn slli16<const N: i32>(v: int16x8_t) -> int16x8_t {
     vreinterpretq_s16_s8(byte_shift_left::<N>(vreinterpretq_s8_s16(v)))
 }
@@ -217,6 +244,7 @@ unsafe fn slli16<const N: i32>(v: int16x8_t) -> int16x8_t {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn srli16<const N: i32>(v: int16x8_t) -> int16x8_t {
     vreinterpretq_s16_s8(byte_shift_right::<N>(vreinterpretq_s8_s16(v)))
 }
@@ -231,36 +259,43 @@ impl Simd for NeonI16 {
     const RSS: i32 = 16 - size_of::<i16>() as i32; // 14
     const NEG_INF: i16 = NEG_INF_I16;
 
+    #[inline(always)]
     fn splat(value: i16) -> int16x8_t {
         // SAFETY: only reached after `is_aarch64_feature_detected!("neon")` (see module Safety note).
         unsafe { set1_16(value) }
     }
 
+    #[inline(always)]
     fn add(a: int16x8_t, b: int16x8_t) -> int16x8_t {
         // SAFETY: see `splat`. Non-saturating `vaddq_s16` (NOT `vqaddq_s16`) per Global Constraints.
         unsafe { add16(a, b) }
     }
 
+    #[inline(always)]
     fn sub(a: int16x8_t, b: int16x8_t) -> int16x8_t {
         // SAFETY: see `splat`. Non-saturating `vsubq_s16`.
         unsafe { sub16(a, b) }
     }
 
+    #[inline(always)]
     fn min(a: int16x8_t, b: int16x8_t) -> int16x8_t {
         // SAFETY: see `splat`.
         unsafe { min16(a, b) }
     }
 
+    #[inline(always)]
     fn max(a: int16x8_t, b: int16x8_t) -> int16x8_t {
         // SAFETY: see `splat`.
         unsafe { max16(a, b) }
     }
 
+    #[inline(always)]
     fn or(a: int16x8_t, b: int16x8_t) -> int16x8_t {
         // SAFETY: see `splat`.
         unsafe { or16(a, b) }
     }
 
+    #[inline(always)]
     fn loadu(src: &[i16]) -> int16x8_t {
         debug_assert!(src.len() >= Self::LANES);
         // SAFETY: see `splat`; the `debug_assert` (and the trait's documented precondition)
@@ -268,17 +303,27 @@ impl Simd for NeonI16 {
         unsafe { loadu16(src.as_ptr()) }
     }
 
+    #[inline(always)]
     fn storeu(v: int16x8_t, dst: &mut [i16]) {
         debug_assert!(dst.len() >= Self::LANES);
         // SAFETY: see `loadu`, mirrored for the 8-`i16` write.
         unsafe { storeu16(dst.as_mut_ptr(), v) }
     }
 
+    #[inline(always)]
+    fn store_widened_i32(v: int16x8_t, dst: &mut [i32]) {
+        debug_assert!(dst.len() >= Self::LANES);
+        // SAFETY: see `splat`; the `debug_assert` guarantees `dst` covers the 8 `i32` written.
+        unsafe { store_widen_i16(dst.as_mut_ptr(), v) }
+    }
+
+    #[inline(always)]
     fn slli<const N: i32>(v: int16x8_t) -> int16x8_t {
         // SAFETY: see `splat`.
         unsafe { slli16::<N>(v) }
     }
 
+    #[inline(always)]
     fn srli<const N: i32>(v: int16x8_t) -> int16x8_t {
         // SAFETY: see `splat`.
         unsafe { srli16::<N>(v) }
@@ -286,6 +331,7 @@ impl Simd for NeonI16 {
 
     /// Diagonal shift by `LSS = 2` bytes (one `i16` lane) — the literal for this width, matching
     /// [`super::sse41::Sse41I16::slli_one_lane`]'s `slli_si::<2>`.
+    #[inline(always)]
     fn slli_one_lane(v: int16x8_t) -> int16x8_t {
         // SAFETY: see `splat`.
         unsafe { slli16::<2>(v) }
@@ -293,11 +339,13 @@ impl Simd for NeonI16 {
 
     /// Carry shift by `RSS = 14` bytes (isolate lane 7 into lane 0) — the literal for this width,
     /// matching [`super::sse41::Sse41I16::srli_top_lane`]'s `srli_si::<14>`.
+    #[inline(always)]
     fn srli_top_lane(v: int16x8_t) -> int16x8_t {
         // SAFETY: see `splat`.
         unsafe { srli16::<14>(v) }
     }
 
+    #[inline(always)]
     fn horizontal_max(v: int16x8_t) -> i16 {
         let mut lanes = [0i16; 8];
         Self::storeu(v, &mut lanes);
@@ -309,6 +357,7 @@ impl Simd for NeonI16 {
     /// Hand-unrolled 3-step ladder with byte-shifts `[2, 4, 8]` (`impl:182-184`), identical to
     /// [`super::sse41::Sse41I16::prefix_max`]; each step is the shared [`Simd::prefix_max_step`]
     /// with that step's literal byte-shift constant.
+    #[inline(always)]
     fn prefix_max(v: int16x8_t, penalties: &[int16x8_t], masks: &[int16x8_t]) -> int16x8_t {
         debug_assert!(penalties.len() >= Self::LOG_LANES as usize);
         debug_assert!(masks.len() >= Self::LOG_LANES as usize);
@@ -330,6 +379,7 @@ pub(crate) struct NeonI32;
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn add32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
     vaddq_s32(a, b)
 }
@@ -339,6 +389,7 @@ unsafe fn add32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn sub32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
     vsubq_s32(a, b)
 }
@@ -347,7 +398,10 @@ unsafe fn sub32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
 ///
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
+// Test-only trait op; see the note on `min16` above.
+#[allow(dead_code)]
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn min32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
     vminq_s32(a, b)
 }
@@ -357,6 +411,7 @@ unsafe fn min32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn max32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
     vmaxq_s32(a, b)
 }
@@ -366,6 +421,7 @@ unsafe fn max32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn or32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
     vorrq_s32(a, b)
 }
@@ -375,6 +431,7 @@ unsafe fn or32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn set1_32(value: i32) -> int32x4_t {
     vdupq_n_s32(value)
 }
@@ -384,6 +441,7 @@ unsafe fn set1_32(value: i32) -> int32x4_t {
 /// # Safety
 /// Caller must guarantee NEON is available AND that `src` points to at least 4 readable `i32`.
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn loadu32(src: *const i32) -> int32x4_t {
     vld1q_s32(src)
 }
@@ -393,6 +451,7 @@ unsafe fn loadu32(src: *const i32) -> int32x4_t {
 /// # Safety
 /// Caller must guarantee NEON is available AND that `dst` points to at least 4 writable `i32`.
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn storeu32(dst: *mut i32, v: int32x4_t) {
     vst1q_s32(dst, v);
 }
@@ -402,6 +461,7 @@ unsafe fn storeu32(dst: *mut i32, v: int32x4_t) {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn slli32<const N: i32>(v: int32x4_t) -> int32x4_t {
     vreinterpretq_s32_s8(byte_shift_left::<N>(vreinterpretq_s8_s32(v)))
 }
@@ -411,6 +471,7 @@ unsafe fn slli32<const N: i32>(v: int32x4_t) -> int32x4_t {
 /// # Safety
 /// Caller must guarantee NEON is available (see the module-level Safety note).
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn srli32<const N: i32>(v: int32x4_t) -> int32x4_t {
     vreinterpretq_s32_s8(byte_shift_right::<N>(vreinterpretq_s8_s32(v)))
 }
@@ -425,36 +486,43 @@ impl Simd for NeonI32 {
     const RSS: i32 = 16 - size_of::<i32>() as i32; // 12
     const NEG_INF: i32 = NEG_INF_I32;
 
+    #[inline(always)]
     fn splat(value: i32) -> int32x4_t {
         // SAFETY: only reached after `is_aarch64_feature_detected!("neon")` (see module Safety note).
         unsafe { set1_32(value) }
     }
 
+    #[inline(always)]
     fn add(a: int32x4_t, b: int32x4_t) -> int32x4_t {
         // SAFETY: see `splat`. Non-saturating `vaddq_s32` (NOT `vqaddq_s32`) per Global Constraints.
         unsafe { add32(a, b) }
     }
 
+    #[inline(always)]
     fn sub(a: int32x4_t, b: int32x4_t) -> int32x4_t {
         // SAFETY: see `splat`. Non-saturating `vsubq_s32`.
         unsafe { sub32(a, b) }
     }
 
+    #[inline(always)]
     fn min(a: int32x4_t, b: int32x4_t) -> int32x4_t {
         // SAFETY: see `splat`.
         unsafe { min32(a, b) }
     }
 
+    #[inline(always)]
     fn max(a: int32x4_t, b: int32x4_t) -> int32x4_t {
         // SAFETY: see `splat`.
         unsafe { max32(a, b) }
     }
 
+    #[inline(always)]
     fn or(a: int32x4_t, b: int32x4_t) -> int32x4_t {
         // SAFETY: see `splat`.
         unsafe { or32(a, b) }
     }
 
+    #[inline(always)]
     fn loadu(src: &[i32]) -> int32x4_t {
         debug_assert!(src.len() >= Self::LANES);
         // SAFETY: see `splat`; the `debug_assert` (and the trait's documented precondition)
@@ -462,17 +530,28 @@ impl Simd for NeonI32 {
         unsafe { loadu32(src.as_ptr()) }
     }
 
+    #[inline(always)]
     fn storeu(v: int32x4_t, dst: &mut [i32]) {
         debug_assert!(dst.len() >= Self::LANES);
         // SAFETY: see `loadu`, mirrored for the 4-`i32` write.
         unsafe { storeu32(dst.as_mut_ptr(), v) }
     }
 
+    #[inline(always)]
+    fn store_widened_i32(v: int32x4_t, dst: &mut [i32]) {
+        debug_assert!(dst.len() >= Self::LANES);
+        // Elem is already `i32`; the "widen" is a plain 4-`i32` store.
+        // SAFETY: see `loadu`, mirrored for the 4-`i32` write.
+        unsafe { storeu32(dst.as_mut_ptr(), v) }
+    }
+
+    #[inline(always)]
     fn slli<const N: i32>(v: int32x4_t) -> int32x4_t {
         // SAFETY: see `splat`.
         unsafe { slli32::<N>(v) }
     }
 
+    #[inline(always)]
     fn srli<const N: i32>(v: int32x4_t) -> int32x4_t {
         // SAFETY: see `splat`.
         unsafe { srli32::<N>(v) }
@@ -480,6 +559,7 @@ impl Simd for NeonI32 {
 
     /// Diagonal shift by `LSS = 4` bytes (one `i32` lane) — the literal for this width, matching
     /// [`super::sse41::Sse41I32::slli_one_lane`]'s `slli_si::<4>`.
+    #[inline(always)]
     fn slli_one_lane(v: int32x4_t) -> int32x4_t {
         // SAFETY: see `splat`.
         unsafe { slli32::<4>(v) }
@@ -487,11 +567,13 @@ impl Simd for NeonI32 {
 
     /// Carry shift by `RSS = 12` bytes (isolate lane 3 into lane 0) — the literal for this width,
     /// matching [`super::sse41::Sse41I32::srli_top_lane`]'s `srli_si::<12>`.
+    #[inline(always)]
     fn srli_top_lane(v: int32x4_t) -> int32x4_t {
         // SAFETY: see `splat`.
         unsafe { srli32::<12>(v) }
     }
 
+    #[inline(always)]
     fn horizontal_max(v: int32x4_t) -> i32 {
         let mut lanes = [0i32; 4];
         Self::storeu(v, &mut lanes);
@@ -503,6 +585,7 @@ impl Simd for NeonI32 {
     /// Hand-unrolled 2-step ladder with byte-shifts `[4, 8]` (`impl:217-218`), identical to
     /// [`super::sse41::Sse41I32::prefix_max`]; each step is the shared [`Simd::prefix_max_step`]
     /// with that step's literal byte-shift constant.
+    #[inline(always)]
     fn prefix_max(v: int32x4_t, penalties: &[int32x4_t], masks: &[int32x4_t]) -> int32x4_t {
         debug_assert!(penalties.len() >= Self::LOG_LANES as usize);
         debug_assert!(masks.len() >= Self::LOG_LANES as usize);
@@ -694,6 +777,31 @@ mod tests {
         assert_eq!(unpack16(NeonI16::slli_one_lane(v)), shift_left_i16(&a, 2));
         // srli_top_lane = shift right by RSS = 14 bytes (lane 7 into lane 0).
         assert_eq!(unpack16(NeonI16::srli_top_lane(v)), shift_right_i16(&a, 14));
+    }
+
+    #[test]
+    fn i16_store_widened_i32_sign_extends_all_lanes() {
+        if !neon_available() {
+            return;
+        }
+        let src = [-5i16, 2, -9, 11, i16::MIN, i16::MAX, 0, -1];
+        let v = NeonI16::loadu(&src);
+        let mut dst = [0i32; 8];
+        NeonI16::store_widened_i32(v, &mut dst);
+        let expected: [i32; 8] = std::array::from_fn(|k| i32::from(src[k]));
+        assert_eq!(dst, expected);
+    }
+
+    #[test]
+    fn i32_store_widened_i32_is_a_plain_store() {
+        if !neon_available() {
+            return;
+        }
+        let src = [-5i32, 123_456, i32::MIN, i32::MAX];
+        let v = NeonI32::loadu(&src);
+        let mut dst = [0i32; 4];
+        NeonI32::store_widened_i32(v, &mut dst);
+        assert_eq!(dst, src);
     }
 
     #[test]

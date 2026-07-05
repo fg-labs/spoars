@@ -44,12 +44,14 @@ pub(crate) trait ElemFromI32: Copy {
 }
 
 impl ElemFromI32 for i16 {
+    #[inline(always)]
     fn from_i32(value: i32) -> i16 {
         value as i16
     }
 }
 
 impl ElemFromI32 for i32 {
+    #[inline(always)]
     fn from_i32(value: i32) -> i32 {
         value
     }
@@ -65,12 +67,14 @@ pub(crate) trait ElemToI32: Copy {
 }
 
 impl ElemToI32 for i16 {
+    #[inline(always)]
     fn to_i32(self) -> i32 {
         i32::from(self)
     }
 }
 
 impl ElemToI32 for i32 {
+    #[inline(always)]
     fn to_i32(self) -> i32 {
         self
     }
@@ -92,11 +96,8 @@ impl ElemToI32 for i32 {
 /// this one is column-0-free (`matrix_width` here is `ceil(seq.len() / S::LANES)` vector columns,
 /// not `seq.len() + 1` scalar columns) and is what the vectorized fill reads; the row-major one is
 /// what the shared scalar backtrack reads.
-// Not yet called outside this module's own tests: a later SIMD kernels plan task (the first
-// vectorized fill) wires this into the real pipeline, at which point this `allow` is removed (see
-// `SimdEngine`'s identical rationale in `simd/mod.rs`).
-#[allow(dead_code)]
-pub(crate) fn build_profile<S>(graph: &Graph, seq: &[u8], scoring: Scoring) -> Vec<S::Vec>
+#[inline]
+pub(crate) fn build_profile<S>(out: &mut Vec<S::Vec>, graph: &Graph, seq: &[u8], scoring: Scoring)
 where
     S: Simd,
     S::Elem: ElemFromI32,
@@ -111,7 +112,11 @@ where
         .max(abs(scoring.g))
         .max(abs(scoring.q)));
 
-    let mut profile = Vec::with_capacity(num_codes * matrix_width_vecs);
+    // Reuse the caller's grow-only buffer: `clear` keeps the allocation, `reserve` grows capacity
+    // only when this (possibly larger) sequence needs it. The profile is fully rebuilt every call
+    // (it depends on `seq`), so no stale entry from a prior alignment can survive.
+    out.clear();
+    out.reserve(num_codes * matrix_width_vecs);
     let mut lane_buf = vec![S::Elem::from_i32(0); S::LANES];
 
     for code in 0..num_codes {
@@ -130,11 +135,9 @@ where
                 };
                 *lane = S::Elem::from_i32(score);
             }
-            profile.push(S::loadu(&lane_buf));
+            out.push(S::loadu(&lane_buf));
         }
     }
-
-    profile
 }
 
 /// Writes a striped fill's INTERIOR cells (graph rows `>= 1`, sequence columns `1..=seq_len`)
@@ -147,8 +150,15 @@ where
 /// lane `k` of a row holds the fill's value at 0-based sequence position `j * S::LANES + k`; lanes
 /// at or past `seq_len` (the striped profile's trailing padding lanes, see [`build_profile`]) are
 /// simply not written to `dst` — there is no column for them.
-// See `build_profile`'s identical `#[allow(dead_code)]` rationale above.
-#[allow(dead_code)]
+// `#[inline(always)]` (not plain `#[inline]`) is load-bearing for x86 performance, mirroring the P1
+// fill fix: this is the per-cell-heavy transpose (`O(node_count * seq_len)` stores). Left as a plain
+// `#[inline]` the compiler kept it out-of-line, so it was codegen'd WITHOUT the caller's
+// `#[target_feature(enable = "avx2")]`, forcing every `S::storeu` into a non-inlined call plus a
+// `vzeroupper` AVX->SSE transition per segment (profiling showed `storeu` as its own ~29% frame and
+// `vzeroupper` ~10% on AVX2 — precisely why AVX2 trailed SSE4.1). Forcing the inline folds the whole
+// destripe into the `run_avx2_*`/`run_sse41_*` target_feature entry so the 256-bit stores inline and
+// the transitions vanish. Output is unchanged.
+#[inline(always)]
 pub(crate) fn destripe_interior<S>(
     dst: &mut [i32],
     matrix: &[S::Vec],
@@ -163,17 +173,35 @@ pub(crate) fn destripe_interior<S>(
     }
     let row_major_width = seq_len + 1;
     let num_interior_rows = matrix.len() / matrix_width_vecs;
+
+    // A segment `s` is "full" when all `LANES` of its lanes map to real sequence columns, i.e.
+    // `(s + 1) * LANES <= seq_len`. Full segments de-stripe via a single contiguous widen-and-store
+    // (`store_widened_i32`); the trailing partial segment (present iff `seq_len % LANES != 0`), whose
+    // high lanes are the striped profile's padding, falls back to the per-lane scalar path below.
+    let full_segments = seq_len / S::LANES;
     let mut lane_buf = vec![S::Elem::from_i32(0); S::LANES];
 
     for row in 0..num_interior_rows {
         let i = row + 1;
-        for segment in 0..matrix_width_vecs {
-            S::storeu(matrix[row * matrix_width_vecs + segment], &mut lane_buf);
+        let row_base = i * row_major_width;
+        let matrix_row_base = row * matrix_width_vecs;
+
+        for segment in 0..full_segments {
+            // Lanes 0..LANES map to consecutive columns `segment*LANES + 1 ..= (segment+1)*LANES`,
+            // all `<= seq_len` (< row_major_width), so this stays within row `i`.
+            let dst_start = row_base + segment * S::LANES + 1;
+            S::store_widened_i32(
+                matrix[matrix_row_base + segment],
+                &mut dst[dst_start..dst_start + S::LANES],
+            );
+        }
+
+        for segment in full_segments..matrix_width_vecs {
+            S::storeu(matrix[matrix_row_base + segment], &mut lane_buf);
             for (k, &lane) in lane_buf.iter().enumerate() {
                 let pos = segment * S::LANES + k;
                 if pos < seq_len {
-                    let j = pos + 1;
-                    dst[i * row_major_width + j] = lane.to_i32();
+                    dst[row_base + pos + 1] = lane.to_i32();
                 }
             }
         }
@@ -188,8 +216,11 @@ pub(crate) fn destripe_interior<S>(
 /// This is a thin, parameter-reordered wrapper over [`crate::align::sisd::seed_scalar_buffers`]
 /// (which itself calls straight through to `SisdEngine::initialize`) — see the module doc's "C2
 /// fix" section for why this call-through, not a second implementation, is load-bearing.
-// See `build_profile`'s identical `#[allow(dead_code)]` rationale above.
+// Only reached from this module's own tests: the live pipeline seeds row 0 / column 0 through
+// `SisdEngine::initialize` directly (the C2 fix), not this wrapper, so it is dead in a non-test
+// build on every target — hence the `allow`.
 #[allow(dead_code)]
+#[inline]
 pub(crate) fn seed_scalar_buffers(
     graph: &Graph,
     seq: &[u8],
@@ -214,8 +245,7 @@ pub(crate) fn seed_scalar_buffers(
 /// now-lower-indexed neighbor's `neg_inf`; the top lane's value is shifted out), so constructing
 /// it directly is equivalent without needing a dynamic (non-compile-time-constant) shift amount,
 /// which [`Simd::slli`]'s `const N` signature does not accept.
-// See `build_profile`'s identical `#[allow(dead_code)]` rationale above.
-#[allow(dead_code)]
+#[inline]
 pub(crate) fn build_masks<S>(neg_inf: S::Elem) -> Vec<S::Vec>
 where
     S: Simd,
@@ -251,8 +281,7 @@ where
 /// `penalties[i] = penalties[i-1] + penalties[i-1]` (doubling via vector `add`, matching
 /// upstream's `_mmxxx_add_epi(penalties[i-1], penalties[i-1])` rather than a separate "multiply by
 /// 2" primitive [`Simd`] doesn't otherwise need).
-// See `build_profile`'s identical `#[allow(dead_code)]` rationale above.
-#[allow(dead_code)]
+#[inline]
 pub(crate) fn build_penalties<S>(penalty: S::Elem) -> Vec<S::Vec>
 where
     S: Simd,
@@ -352,6 +381,11 @@ mod tests {
             dst[..4].copy_from_slice(&v.0);
         }
 
+        fn store_widened_i32(v: TestVec4, dst: &mut [i32]) {
+            // Elem is already `i32` for the 4-lane test vector; "widen" is a plain copy.
+            dst[..4].copy_from_slice(&v.0);
+        }
+
         fn slli<const N: i32>(v: TestVec4) -> TestVec4 {
             let lane_shift = (N / 4) as usize;
             let mut out = [0i32; 4];
@@ -425,7 +459,8 @@ mod tests {
         let scoring = linear_scoring();
         let seq = b"AGGT";
 
-        let profile = build_profile::<ScalarSimdI32>(&graph, seq, scoring);
+        let mut profile = Vec::new();
+        build_profile::<ScalarSimdI32>(&mut profile, &graph, seq, scoring);
         let seeded = seed_scalar_buffers(&graph, seq, scoring, AlignmentType::Global);
 
         let matrix_width_vecs = seq.len(); // LANES == 1
@@ -448,7 +483,8 @@ mod tests {
         let scoring = Scoring::new(5, -4, -8, -6, -10, -4).unwrap(); // m=5,n=-4,g=-8,q=-10
         let seq = b"AAAAA"; // seq_len = 5, matches the graph's single code every position
 
-        let profile = build_profile::<TestSimd4>(&graph, seq, scoring);
+        let mut profile = Vec::new();
+        build_profile::<TestSimd4>(&mut profile, &graph, seq, scoring);
         // matrix_width_vecs = ceil(5/4) = 2, one code => 2 vectors total.
         assert_eq!(profile.len(), 2);
 
@@ -467,7 +503,8 @@ mod tests {
         let scoring = linear_scoring();
         let seq = b"CCCC";
 
-        let profile = build_profile::<TestSimd4>(&graph, seq, scoring);
+        let mut profile = Vec::new();
+        build_profile::<TestSimd4>(&mut profile, &graph, seq, scoring);
         assert_eq!(profile.len(), 1);
         assert_eq!(profile[0], TestVec4([-4, -4, -4, -4]));
     }
