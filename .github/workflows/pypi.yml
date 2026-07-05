@@ -1,0 +1,82 @@
+name: PyPI
+
+# Publishes `spoars` wheels to PyPI when a GitHub release is published.
+#
+# Trigger chain:
+#   1. release-plz PR merges to `main`.
+#   2. `publish.yml` runs `cargo publish` for the Rust crate.
+#   3. `publish.yml` creates a GitHub release tagged `v<VERSION>`.
+#   4. The `release: published` event fires this workflow.
+#
+# `workflow_dispatch` is available for one-off manual republishes against an
+# existing tag; pick the tag in the run dialog (sets `github.ref` to that tag).
+#
+# PyPI authentication uses Trusted Publishing (OIDC). The PyPI project `spoars`
+# must have a configured publisher pointing at this workflow file and the `pypi`
+# environment before the first run; see CONTRIBUTING.md.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: spoars-py
+
+jobs:
+  wheels:
+    name: wheel (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2_28"
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.release.tag_name || github.ref }}
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: spoars-py
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheel-${{ matrix.target }}
+          path: spoars-py/dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    name: Upload to PyPI
+    needs: [wheels]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/spoars
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Show artifact set
+        working-directory: .
+        run: ls -lh dist/
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: dist/

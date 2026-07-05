@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/fg-labs/spoars/actions/workflows/check.yml/badge.svg)](https://github.com/fg-labs/spoars/actions/workflows/check.yml)
 [![crates.io](https://img.shields.io/crates/v/spoars.svg)](https://crates.io/crates/spoars)
+[![PyPI](https://img.shields.io/pypi/v/spoars.svg)](https://pypi.org/project/spoars/)
 [![docs.rs](https://docs.rs/spoars/badge.svg)](https://docs.rs/spoars)
 [![codecov](https://codecov.io/gh/fg-labs/spoars/branch/main/graph/badge.svg)](https://codecov.io/gh/fg-labs/spoars)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -44,6 +45,31 @@ assert_eq!(graph.generate_consensus(), "ACGTACGT");
 let msa = graph.generate_msa(false); // one row per read
 assert_eq!(msa.len(), 3);
 ```
+
+## Python
+
+Python bindings (built with [maturin](https://www.maturin.rs/), sources in [`spoars-py/`](spoars-py)) wrap the same engine:
+
+```bash
+pip install spoars
+```
+
+```python
+import spoars
+
+g = spoars.poa(["ACGTACGT", "ACGTTCGT", "ACGTACGT"])
+g.consensus()   # "ACGTACGT"
+g.msa()         # ['ACGTACGT', 'ACGTTCGT', 'ACGTACGT']
+
+# Or build incrementally with an alignment type + scoring:
+g = spoars.Poa(alignment_type="global", scoring=spoars.Scoring.default())
+for read in ["ACGTACGT", "ACGTTCGT", "ACGTACGT"]:
+    g.add(read)
+g.consensus(min_coverage=2)
+g.gfa()         # GFA v1
+```
+
+See [`spoars-py/README.md`](spoars-py/README.md) for the full Python API.
 
 ## Engines: scalar and SIMD, same answer
 
