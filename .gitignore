@@ -1,6 +1,8 @@
 /target
 /oracle/build
 /.superpowers/
+# Local profiling artifacts (samply/sample/tricorder captures); see benches/README.md.
+/profiles/
 
 # Python bindings (spoars-py) build/dev artifacts. pixi.lock IS tracked.
 /spoars-py/target
