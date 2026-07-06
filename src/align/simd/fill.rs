@@ -297,6 +297,15 @@ where
     };
     let mut max_i: usize = 0; // 0 == "not found" (real rows are >= 1)
     let last_column_id = (seq_len - 1) % lanes;
+    // The tier's saturating sentinel widened to i32 (int16 tier: -31744; int32 tier: the scalar
+    // NEG_INF). Any banded Global/Overlap endpoint score at or below this is a resize-refilled
+    // out-of-band cell, or a saturated in-band cell with no reachable path — never a real DP value
+    // (the `Escalation` guard keeps real scores far above it). Such reads are normalized to the
+    // scalar NEG_INF so a sentinel can neither win the strict-`<` max nor slip past the
+    // `align_simd_*` `max_score == NEG_INF` guard as a bogus (tier-scaled) score. On the unbanded
+    // path every tracked endpoint is a real value above this floor, so the normalization is a
+    // no-op there (the parity suite pins `None` bit-exact).
+    let sentinel_floor = S::NEG_INF.to_i32();
 
     for &node_id in &graph.rank_to_node {
         let node = &graph.nodes[node_id.0 as usize];
@@ -415,7 +424,12 @@ where
             }
             AlignmentType::Overlap => {
                 if node.outedges.is_empty() {
-                    let row_score = row_max::<S>(score);
+                    // Overlap's row score already reduces over the in-band segments only (Task 6).
+                    // A sink whose in-band window holds no reachable overlap endpoint yields only
+                    // the tier sentinel; normalize it to the scalar NEG_INF so it neither wins the
+                    // max nor leaks past the caller's guard (a no-op for any real endpoint).
+                    let raw = row_max::<S>(score);
+                    let row_score = if raw <= sentinel_floor { NEG_INF } else { raw };
                     if max_score < row_score {
                         max_score = row_score;
                         max_i = i;
@@ -424,8 +438,36 @@ where
             }
             AlignmentType::Global => {
                 if node.outedges.is_empty() {
-                    let last = striped_h[row_base + (matrix_width_vecs - 1)];
-                    let row_score = value_at::<S>(last, last_column_id);
+                    // Global/NW is end-to-end in the query: the ONLY valid endpoint is column L
+                    // (the last query column). Read `H[sink, L]` directly — the "column L or
+                    // sentinel" rule — and do NOT scan for a best in-band cell, which would return a
+                    // partial-query score for an alignment that never consumed the whole query.
+                    //
+                    // Under banding column L is a real value only when the last striped segment lies
+                    // in this sink's window; otherwise that cell is the resize-refilled tier
+                    // sentinel. Reading it either way (out-of-band, or in-band but saturated with no
+                    // reachable end-to-end path) yields `<= sentinel_floor`, which we normalize to
+                    // the scalar NEG_INF. Without this, the int16 sentinel (-31744) widens far above
+                    // the scalar NEG_INF and would (a) win the strict-`<` max over the NEG_INF-seeded
+                    // `max_score`, selecting an out-of-band sink, and (b) slip past the
+                    // `align_simd_*` `max_score == NEG_INF` guard as a bogus tier-scaled score. With
+                    // the current anchor scheme every sink has `R = 0 ⇒ anchor = L`, so the last
+                    // segment is always in band; the band gate is the forward-compatible guard for
+                    // true per-sink anchors (design §Risks, Open) where an early-ending sink's window
+                    // need not reach L.
+                    let last_seg = matrix_width_vecs - 1;
+                    let in_band = beg_sn <= last_seg && last_seg < end_sn;
+                    let row_score = if in_band {
+                        let last = striped_h[row_base + last_seg];
+                        let raw = value_at::<S>(last, last_column_id);
+                        if raw <= sentinel_floor {
+                            NEG_INF
+                        } else {
+                            raw
+                        }
+                    } else {
+                        NEG_INF
+                    };
                     if max_score < row_score {
                         max_score = row_score;
                         max_i = i;
@@ -571,6 +613,15 @@ where
     };
     let mut max_i: usize = 0; // 0 == "not found" (real rows are >= 1)
     let last_column_id = (seq_len - 1) % lanes;
+    // The tier's saturating sentinel widened to i32 (int16 tier: -31744; int32 tier: the scalar
+    // NEG_INF). Any banded Global/Overlap endpoint score at or below this is a resize-refilled
+    // out-of-band cell, or a saturated in-band cell with no reachable path — never a real DP value
+    // (the `Escalation` guard keeps real scores far above it). Such reads are normalized to the
+    // scalar NEG_INF so a sentinel can neither win the strict-`<` max nor slip past the
+    // `align_simd_*` `max_score == NEG_INF` guard as a bogus (tier-scaled) score. On the unbanded
+    // path every tracked endpoint is a real value above this floor, so the normalization is a
+    // no-op there (the parity suite pins `None` bit-exact).
+    let sentinel_floor = S::NEG_INF.to_i32();
 
     for &node_id in &graph.rank_to_node {
         let node = &graph.nodes[node_id.0 as usize];
@@ -697,7 +748,12 @@ where
             }
             AlignmentType::Overlap => {
                 if node.outedges.is_empty() {
-                    let row_score = row_max::<S>(score);
+                    // Overlap's row score already reduces over the in-band segments only (Task 6).
+                    // A sink whose in-band window holds no reachable overlap endpoint yields only
+                    // the tier sentinel; normalize it to the scalar NEG_INF so it neither wins the
+                    // max nor leaks past the caller's guard (a no-op for any real endpoint).
+                    let raw = row_max::<S>(score);
+                    let row_score = if raw <= sentinel_floor { NEG_INF } else { raw };
                     if max_score < row_score {
                         max_score = row_score;
                         max_i = i;
@@ -706,8 +762,36 @@ where
             }
             AlignmentType::Global => {
                 if node.outedges.is_empty() {
-                    let last = striped_h[row_base + (matrix_width_vecs - 1)];
-                    let row_score = value_at::<S>(last, last_column_id);
+                    // Global/NW is end-to-end in the query: the ONLY valid endpoint is column L
+                    // (the last query column). Read `H[sink, L]` directly — the "column L or
+                    // sentinel" rule — and do NOT scan for a best in-band cell, which would return a
+                    // partial-query score for an alignment that never consumed the whole query.
+                    //
+                    // Under banding column L is a real value only when the last striped segment lies
+                    // in this sink's window; otherwise that cell is the resize-refilled tier
+                    // sentinel. Reading it either way (out-of-band, or in-band but saturated with no
+                    // reachable end-to-end path) yields `<= sentinel_floor`, which we normalize to
+                    // the scalar NEG_INF. Without this, the int16 sentinel (-31744) widens far above
+                    // the scalar NEG_INF and would (a) win the strict-`<` max over the NEG_INF-seeded
+                    // `max_score`, selecting an out-of-band sink, and (b) slip past the
+                    // `align_simd_*` `max_score == NEG_INF` guard as a bogus tier-scaled score. With
+                    // the current anchor scheme every sink has `R = 0 ⇒ anchor = L`, so the last
+                    // segment is always in band; the band gate is the forward-compatible guard for
+                    // true per-sink anchors (design §Risks, Open) where an early-ending sink's window
+                    // need not reach L.
+                    let last_seg = matrix_width_vecs - 1;
+                    let in_band = beg_sn <= last_seg && last_seg < end_sn;
+                    let row_score = if in_band {
+                        let last = striped_h[row_base + last_seg];
+                        let raw = value_at::<S>(last, last_column_id);
+                        if raw <= sentinel_floor {
+                            NEG_INF
+                        } else {
+                            raw
+                        }
+                    } else {
+                        NEG_INF
+                    };
                     if max_score < row_score {
                         max_score = row_score;
                         max_i = i;
@@ -876,6 +960,15 @@ where
     };
     let mut max_i: usize = 0; // 0 == "not found" (real rows are >= 1)
     let last_column_id = (seq_len - 1) % lanes;
+    // The tier's saturating sentinel widened to i32 (int16 tier: -31744; int32 tier: the scalar
+    // NEG_INF). Any banded Global/Overlap endpoint score at or below this is a resize-refilled
+    // out-of-band cell, or a saturated in-band cell with no reachable path — never a real DP value
+    // (the `Escalation` guard keeps real scores far above it). Such reads are normalized to the
+    // scalar NEG_INF so a sentinel can neither win the strict-`<` max nor slip past the
+    // `align_simd_*` `max_score == NEG_INF` guard as a bogus (tier-scaled) score. On the unbanded
+    // path every tracked endpoint is a real value above this floor, so the normalization is a
+    // no-op there (the parity suite pins `None` bit-exact).
+    let sentinel_floor = S::NEG_INF.to_i32();
 
     for &node_id in &graph.rank_to_node {
         let node = &graph.nodes[node_id.0 as usize];
@@ -1024,7 +1117,12 @@ where
             }
             AlignmentType::Overlap => {
                 if node.outedges.is_empty() {
-                    let row_score = row_max::<S>(score);
+                    // Overlap's row score already reduces over the in-band segments only (Task 6).
+                    // A sink whose in-band window holds no reachable overlap endpoint yields only
+                    // the tier sentinel; normalize it to the scalar NEG_INF so it neither wins the
+                    // max nor leaks past the caller's guard (a no-op for any real endpoint).
+                    let raw = row_max::<S>(score);
+                    let row_score = if raw <= sentinel_floor { NEG_INF } else { raw };
                     if max_score < row_score {
                         max_score = row_score;
                         max_i = i;
@@ -1033,8 +1131,36 @@ where
             }
             AlignmentType::Global => {
                 if node.outedges.is_empty() {
-                    let last = striped_h[row_base + (matrix_width_vecs - 1)];
-                    let row_score = value_at::<S>(last, last_column_id);
+                    // Global/NW is end-to-end in the query: the ONLY valid endpoint is column L
+                    // (the last query column). Read `H[sink, L]` directly — the "column L or
+                    // sentinel" rule — and do NOT scan for a best in-band cell, which would return a
+                    // partial-query score for an alignment that never consumed the whole query.
+                    //
+                    // Under banding column L is a real value only when the last striped segment lies
+                    // in this sink's window; otherwise that cell is the resize-refilled tier
+                    // sentinel. Reading it either way (out-of-band, or in-band but saturated with no
+                    // reachable end-to-end path) yields `<= sentinel_floor`, which we normalize to
+                    // the scalar NEG_INF. Without this, the int16 sentinel (-31744) widens far above
+                    // the scalar NEG_INF and would (a) win the strict-`<` max over the NEG_INF-seeded
+                    // `max_score`, selecting an out-of-band sink, and (b) slip past the
+                    // `align_simd_*` `max_score == NEG_INF` guard as a bogus tier-scaled score. With
+                    // the current anchor scheme every sink has `R = 0 ⇒ anchor = L`, so the last
+                    // segment is always in band; the band gate is the forward-compatible guard for
+                    // true per-sink anchors (design §Risks, Open) where an early-ending sink's window
+                    // need not reach L.
+                    let last_seg = matrix_width_vecs - 1;
+                    let in_band = beg_sn <= last_seg && last_seg < end_sn;
+                    let row_score = if in_band {
+                        let last = striped_h[row_base + last_seg];
+                        let raw = value_at::<S>(last, last_column_id);
+                        if raw <= sentinel_floor {
+                            NEG_INF
+                        } else {
+                            raw
+                        }
+                    } else {
+                        NEG_INF
+                    };
                     if max_score < row_score {
                         max_score = row_score;
                         max_i = i;
@@ -2142,5 +2268,177 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Builds a `node_id -> rank` map from a graph, mirroring the fill's own seeding loop (copied
+    /// inline by the other banded tests above).
+    fn ranks_of(graph: &Graph) -> Vec<u32> {
+        let mut m = vec![0u32; graph.num_nodes()];
+        for (rank, &node_id) in graph.rank_order().iter().enumerate() {
+            m[node_id.0 as usize] = rank as u32;
+        }
+        m
+    }
+
+    /// Task 9 — banded Global endpoint. When NO sink's band reaches column L the fill must return
+    /// the "not found" sentinel `(0, 0, NEG_INF)` — never a partial-query score and never a leaked
+    /// tier sentinel. Without the band gate the int16 `S::NEG_INF` (-31744) read from the
+    /// uncomputed last segment would beat the scalar-`NEG_INF`-seeded `max_score`, select an
+    /// out-of-band sink, and hand the backtrack a garbage `max_j = L` — this test is RED against
+    /// that (it observes `(4, 48, -31744)`, not `(0, 0, NEG_INF)`) and GREEN once the gate
+    /// normalizes it.
+    ///
+    /// The band is ADAPTIVE: each row's window is the union of its anchor with its predecessors'
+    /// recorded `best_col`, so for an identical read `best_col` tracks the diagonal and the band
+    /// reaches column L regardless of the anchor. To place column L genuinely out of every sink's
+    /// window we use a SHORT graph (4 nodes) against a LONG query (48 columns): `best_col` can only
+    /// advance ~1 column per graph row, so over four rows it never gets near column 47, and the
+    /// anchor is pinned to 0 (`R = L`) so it cannot pull the window rightward either. The sink's
+    /// last striped segment (column L) is therefore never computed. This mirrors the future
+    /// true-per-sink-anchor case (design §Risks, Open) where an early-ending sink's window need not
+    /// reach L.
+    #[test]
+    fn banded_global_returns_sentinel_when_column_l_out_of_band() {
+        let seq = b"ACGTTGCAGATCCGTAAGCTTACGGATCAGTTCAGGATCACGTTGCAA";
+        let seq_len = seq.len();
+        let scoring = Scoring::new(5, -4, -8, -6, -10, -4).unwrap();
+
+        // A short graph against the long query: the whole graph is only 4 nodes deep.
+        let mut graph = Graph::new();
+        graph.add_alignment_weight(&[], b"ACGT", 1).unwrap();
+        let n = graph.num_nodes();
+
+        // anchor = L - R = 0 for every node; a half-width of 1 plus the shallow graph keeps `best_col`
+        // (and hence the whole band) near the query's left edge, so no sink row computes column L.
+        let mut band = BandState {
+            r: vec![seq_len as u32; n],
+            best_col: vec![0; n],
+            w: 1,
+        };
+        let mut h: Vec<<TestSimd as Simd>::Vec> = Vec::new();
+        let result = run_linear(
+            &graph,
+            seq,
+            scoring,
+            AlignmentType::Global,
+            &mut h,
+            Some(&mut band),
+        );
+
+        assert_eq!(
+            result,
+            (0, 0, NEG_INF),
+            "no in-band column-L endpoint must yield the empty-alignment sentinel, not a partial \
+             or leaked-tier-sentinel score",
+        );
+    }
+
+    /// Task 9 — banded Global endpoint. With a band wide enough that column L stays in the sink's
+    /// window, banded Global reproduces the exact (unbanded) `(max_i, max_j, max_score)` exactly:
+    /// the endpoint is column L and the score is the true end-to-end score (the gate is a no-op).
+    #[test]
+    fn banded_global_matches_exact_when_column_l_in_band() {
+        let seq = b"ACGTTGCAGATCCGTAAGCTTACGGATCAGTTCAGGATCACGTTGCAA";
+        let seq_len = seq.len();
+        let scoring = Scoring::new(5, -4, -8, -6, -10, -4).unwrap();
+
+        let mut graph = Graph::new();
+        graph.add_alignment_weight(&[], seq, 1).unwrap();
+        let node_id_to_rank = ranks_of(&graph);
+
+        let mut h_exact: Vec<<TestSimd as Simd>::Vec> = Vec::new();
+        let exact = run_linear(
+            &graph,
+            seq,
+            scoring,
+            AlignmentType::Global,
+            &mut h_exact,
+            None,
+        );
+
+        // A narrow-but-real abPOA band; the identical-read fixture keeps the optimum on the exact
+        // diagonal (in band), so the sink's column-L endpoint is reached with the exact score.
+        let mut band = BandState::new(
+            &graph,
+            &node_id_to_rank,
+            seq_len,
+            BandConfig { base: 2, frac: 0.0 },
+        );
+        let mut h_band: Vec<<TestSimd as Simd>::Vec> = Vec::new();
+        let banded = run_linear(
+            &graph,
+            seq,
+            scoring,
+            AlignmentType::Global,
+            &mut h_band,
+            Some(&mut band),
+        );
+
+        assert_eq!(
+            banded, exact,
+            "banded Global (col L in band) must equal exact Global"
+        );
+        assert_eq!(banded.1, seq_len, "Global endpoint must be column L");
+        assert!(
+            banded.2 > NEG_INF,
+            "Global score must be a real end-to-end score, not a sentinel",
+        );
+    }
+
+    /// Task 9 — banded Overlap endpoint normalization is a no-op for a real endpoint. A sink with a
+    /// reachable in-band overlap endpoint must return that real score UNCHANGED: the fill's
+    /// `raw <= sentinel_floor` normalization fires only on the tier sentinel, never on a real DP
+    /// value (the `Escalation` guard keeps real scores far above the floor).
+    ///
+    /// The all-sentinel Overlap case that WOULD normalize to `NEG_INF` is unreachable through the
+    /// adaptive union band — every sink's window is the union of its anchor with its predecessors'
+    /// `best_col`, and at that column the predecessor holds a real value that flows into the sink's
+    /// row — so the extended `max_score == NEG_INF` guard on Overlap is DEFENSIVE (it becomes live
+    /// only once true per-sink anchors land; design §Risks, Open). This test therefore pins the
+    /// reachable half: that adding the normalization did not corrupt a genuine banded Overlap score.
+    #[test]
+    fn banded_overlap_real_endpoint_is_not_normalized_to_sentinel() {
+        let seq = b"ACGTTGCAGATCCGTAAGCTTACGGATCAGTTCAGGATCACGTTGCAA";
+        let seq_len = seq.len();
+        let scoring = Scoring::new(5, -4, -8, -6, -10, -4).unwrap();
+
+        let mut graph = Graph::new();
+        graph.add_alignment_weight(&[], seq, 1).unwrap();
+        let node_id_to_rank = ranks_of(&graph);
+
+        let mut h_exact: Vec<<TestSimd as Simd>::Vec> = Vec::new();
+        let exact = run_linear(
+            &graph,
+            seq,
+            scoring,
+            AlignmentType::Overlap,
+            &mut h_exact,
+            None,
+        );
+
+        let mut band = BandState::new(
+            &graph,
+            &node_id_to_rank,
+            seq_len,
+            BandConfig { base: 2, frac: 0.0 },
+        );
+        let mut h_band: Vec<<TestSimd as Simd>::Vec> = Vec::new();
+        let banded = run_linear(
+            &graph,
+            seq,
+            scoring,
+            AlignmentType::Overlap,
+            &mut h_band,
+            Some(&mut band),
+        );
+
+        assert_eq!(
+            banded, exact,
+            "banded Overlap real endpoint must equal exact, not be normalized to a sentinel",
+        );
+        assert!(
+            banded.2 > NEG_INF,
+            "a real overlap endpoint must survive the sentinel normalization untouched",
+        );
     }
 }

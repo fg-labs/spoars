@@ -30,7 +30,7 @@ mod sse41;
 pub use band::BandConfig;
 
 use crate::align::backtrack::CellRead;
-use crate::align::sisd::ScalarInit;
+use crate::align::sisd::{ScalarInit, NEG_INF};
 use crate::align::{Alignment, AlignmentEngine, AlignmentType, Scoring, SisdEngine};
 use crate::graph::Graph;
 use band::BandState;
@@ -469,6 +469,7 @@ where
         striped.cached_elem_width = elem_width;
     }
 
+    let is_banded = band.is_some();
     let (max_i, max_j, max_score) = fill::fill_linear::<S>(
         graph,
         seq.len(),
@@ -481,6 +482,17 @@ where
         &mut striped.h,
         band,
     );
+
+    // Band-aware Global/Overlap sentinel guard (design §Fill clip Global fix, MAJOR 5). When
+    // banding leaves no sink with a reachable end-to-end (Global) / overlap (Overlap) endpoint,
+    // `fill_*` returns `max_score == NEG_INF` per its "column L or sentinel" rule. Short-circuit to
+    // the empty alignment the backtrack's `(0, 0)` path already yields, WITHOUT running the
+    // backtrack — whose `debug_assert h.get == max_score` would pass vacuously on the sentinel and
+    // then walk into out-of-band cells. No-op on the unbanded path: exact Global always reaches
+    // column L and Local seeds `max_score = 0`, so `max_score` is never NEG_INF there.
+    if is_banded && max_score == NEG_INF {
+        return (Alignment::new(), NEG_INF);
+    }
 
     // Prototype (option 1): skip the destripe; read the striped H directly via `StripedView`.
     let matrix_width_vecs = seq.len().div_ceil(S::LANES);
@@ -552,6 +564,7 @@ where
         striped.cached_elem_width = elem_width;
     }
 
+    let is_banded = band.is_some();
     let (max_i, max_j, max_score) = fill::fill_affine::<S>(
         graph,
         seq.len(),
@@ -566,6 +579,11 @@ where
         &mut striped.f,
         band,
     );
+
+    // Band-aware Global/Overlap sentinel guard — see `align_simd_linear` for the full rationale.
+    if is_banded && max_score == NEG_INF {
+        return (Alignment::new(), NEG_INF);
+    }
 
     // Prototype (option 1): skip the destripe; read the striped H/E/F directly via `StripedView`.
     let matrix_width_vecs = seq.len().div_ceil(S::LANES);
@@ -697,6 +715,7 @@ where
         striped.cached_elem_width = elem_width;
     }
 
+    let is_banded = band.is_some();
     let (max_i, max_j, max_score) = fill::fill_convex::<S>(
         graph,
         seq.len(),
@@ -714,6 +733,11 @@ where
         &mut striped.q,
         band,
     );
+
+    // Band-aware Global/Overlap sentinel guard — see `align_simd_linear` for the full rationale.
+    if is_banded && max_score == NEG_INF {
+        return (Alignment::new(), NEG_INF);
+    }
 
     // Prototype (option 1): skip the full-matrix destripe. Row 0 / column 0 are already the
     // scalar boundary in the seeded buffers (`reseed_scalar_buffers`); the interior stays striped
@@ -1404,5 +1428,57 @@ mod tests {
         assert!(!should_force_sse41(Some("avx2")));
         assert!(!should_force_sse41(Some("sse4.1")));
         assert!(!should_force_sse41(Some("neon")));
+    }
+
+    /// Task 9 — the `align_simd_*` band guard. When the banded fill finds no reachable Global
+    /// endpoint (`max_score == NEG_INF`), the pipeline must short-circuit to an empty alignment +
+    /// `NEG_INF` WITHOUT running the backtrack (whose `debug_assert h.get == max_score` would pass
+    /// vacuously on the sentinel, then walk into out-of-band cells). `align`'s public path does not
+    /// yet plumb a band (it always passes `None`), so the guard is validated at the
+    /// `align_simd_linear` entry point with the same hand-built all-out-of-band band as the fill
+    /// test `banded_global_returns_sentinel_when_column_l_out_of_band`.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn banded_global_guard_returns_empty_alignment_and_neg_inf() {
+        #[cfg(target_arch = "aarch64")]
+        type TestSimd = crate::align::simd::neon::NeonI16;
+        #[cfg(target_arch = "x86_64")]
+        type TestSimd = crate::align::simd::sse41::Sse41I16;
+
+        let seq = b"ACGTTGCAGATCCGTAAGCTTACGGATCAGTTCAGGATCACGTTGCAA";
+        let scoring = Scoring::new(5, -4, -8, -6, -10, -4).unwrap();
+        // A short (4-node) graph against the long query keeps the adaptive band near the left edge,
+        // so no sink reaches column L (mirrors the fill test of the same name).
+        let graph = linear_graph(b"ACGT");
+        let n = graph.num_nodes();
+
+        let mut seeded = ScalarInit::default();
+        let mut striped =
+            StripedBuffers::<<TestSimd as crate::align::simd::lanes::Simd>::Vec>::default();
+        // anchor = L - R = 0 for every node: no sink reaches column L, so the fill returns NEG_INF.
+        let mut band = BandState {
+            r: vec![seq.len() as u32; n],
+            best_col: vec![0; n],
+            w: 1,
+        };
+
+        let (alignment, score) = align_simd_linear::<TestSimd>(
+            AlignmentType::Global,
+            scoring,
+            seq,
+            &graph,
+            &mut seeded,
+            &mut striped,
+            Some(&mut band),
+        );
+
+        assert!(
+            alignment.is_empty(),
+            "guard must return the empty alignment"
+        );
+        assert_eq!(
+            score, NEG_INF,
+            "guard must return the NEG_INF sentinel score"
+        );
     }
 }
