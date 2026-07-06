@@ -18,6 +18,7 @@
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
+mod band;
 mod fill;
 mod lanes;
 #[cfg(target_arch = "aarch64")]
@@ -25,6 +26,8 @@ mod neon;
 mod profile;
 #[cfg(target_arch = "x86_64")]
 mod sse41;
+
+pub use band::BandConfig;
 
 use crate::align::backtrack::CellRead;
 use crate::align::sisd::ScalarInit;
