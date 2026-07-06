@@ -39,8 +39,9 @@ use super::lanes::Simd;
 use core::arch::aarch64::{
     int16x8_t, int32x4_t, int8x16_t, vaddq_s16, vaddq_s32, vdupq_n_s16, vdupq_n_s32, vdupq_n_s8,
     vextq_s8, vget_high_s16, vget_low_s16, vld1q_s16, vld1q_s32, vmaxq_s16, vmaxq_s32, vminq_s16,
-    vminq_s32, vmovl_s16, vorrq_s16, vorrq_s32, vreinterpretq_s16_s8, vreinterpretq_s32_s8,
-    vreinterpretq_s8_s16, vreinterpretq_s8_s32, vst1q_s16, vst1q_s32, vsubq_s16, vsubq_s32,
+    vminq_s32, vmovl_s16, vorrq_s16, vorrq_s32, vqaddq_s16, vqaddq_s32, vqsubq_s16, vqsubq_s32,
+    vreinterpretq_s16_s8, vreinterpretq_s32_s8, vreinterpretq_s8_s16, vreinterpretq_s8_s32,
+    vst1q_s16, vst1q_s32, vsubq_s16, vsubq_s32,
 };
 
 /// `i16::MIN + 1024`, this backend's `kNegativeInfinity` (see [`Simd::NEG_INF`]).
@@ -149,6 +150,27 @@ unsafe fn add16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
 #[inline]
 unsafe fn sub16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
     vsubq_s16(a, b)
+}
+
+/// Lane-typed `i16` **saturating** add. Ports `_mm_adds_epi16` as NEON `vqaddq_s16` — native
+/// saturating hardware support, unlike the int32 backends (see [`adds32`]).
+///
+/// # Safety
+/// Caller must guarantee NEON is available (see the module-level Safety note).
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn adds16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
+    vqaddq_s16(a, b)
+}
+
+/// Lane-typed `i16` **saturating** sub. Ports `_mm_subs_epi16` as NEON `vqsubq_s16`.
+///
+/// # Safety
+/// Caller must guarantee NEON is available (see the module-level Safety note).
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn subs16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
+    vqsubq_s16(a, b)
 }
 
 /// Lane-typed `i16` signed min. Ports `_mm_min_epi16` (`impl:169`) as NEON `vminq_s16`.
@@ -278,6 +300,18 @@ impl Simd for NeonI16 {
     }
 
     #[inline(always)]
+    fn adds(a: int16x8_t, b: int16x8_t) -> int16x8_t {
+        // SAFETY: see `splat`. Native saturating `vqaddq_s16`.
+        unsafe { adds16(a, b) }
+    }
+
+    #[inline(always)]
+    fn subs(a: int16x8_t, b: int16x8_t) -> int16x8_t {
+        // SAFETY: see `splat`. Native saturating `vqsubq_s16`.
+        unsafe { subs16(a, b) }
+    }
+
+    #[inline(always)]
     fn min(a: int16x8_t, b: int16x8_t) -> int16x8_t {
         // SAFETY: see `splat`.
         unsafe { min16(a, b) }
@@ -394,6 +428,28 @@ unsafe fn sub32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
     vsubq_s32(a, b)
 }
 
+/// Lane-typed `i32` **saturating** add. NEON has native int32 saturation (`vqaddq_s32`), unlike
+/// x86 SSE4.1/AVX2, which have no `_mm(256)_adds_epi32` and must emulate it (see
+/// `super::sse41::adds32`/`super::avx2::adds32`).
+///
+/// # Safety
+/// Caller must guarantee NEON is available (see the module-level Safety note).
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn adds32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+    vqaddq_s32(a, b)
+}
+
+/// Lane-typed `i32` **saturating** sub. Native NEON `vqsubq_s32`; see [`adds32`].
+///
+/// # Safety
+/// Caller must guarantee NEON is available (see the module-level Safety note).
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn subs32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+    vqsubq_s32(a, b)
+}
+
 /// Lane-typed `i32` signed min. Ports `_mm_min_epi32` (`impl:204`) as NEON `vminq_s32`.
 ///
 /// # Safety
@@ -502,6 +558,18 @@ impl Simd for NeonI32 {
     fn sub(a: int32x4_t, b: int32x4_t) -> int32x4_t {
         // SAFETY: see `splat`. Non-saturating `vsubq_s32`.
         unsafe { sub32(a, b) }
+    }
+
+    #[inline(always)]
+    fn adds(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+        // SAFETY: see `splat`. Native saturating `vqaddq_s32` (no x86-style emulation needed).
+        unsafe { adds32(a, b) }
+    }
+
+    #[inline(always)]
+    fn subs(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+        // SAFETY: see `splat`. Native saturating `vqsubq_s32`.
+        unsafe { subs32(a, b) }
     }
 
     #[inline(always)]
@@ -738,6 +806,44 @@ mod tests {
     }
 
     #[test]
+    fn i16_adds_subs_saturate_at_bounds() {
+        if !neon_available() {
+            return;
+        }
+        // adds/subs must clamp at the element bound (native `vqaddq_s16`/`vqsubq_s16`), unlike
+        // `add`/`sub` which wrap.
+        let hi = NeonI16::splat(i16::MAX);
+        let lo = NeonI16::splat(i16::MIN);
+        let one = NeonI16::splat(1);
+        assert_eq!(unpack16(NeonI16::adds(hi, one)), [i16::MAX; 8]);
+        assert_eq!(unpack16(NeonI16::subs(lo, one)), [i16::MIN; 8]);
+
+        // Lane-wise match against the scalar `saturating_add`/`saturating_sub` reference across a
+        // mix of ordinary and boundary values.
+        let a = [
+            3i16,
+            i16::MAX,
+            -2,
+            i16::MIN,
+            0,
+            i16::MAX - 1,
+            -100,
+            i16::MIN + 1,
+        ];
+        let b = [1i16, 1, -3, -1, -5, 2, -50, -2];
+        let va = NeonI16::loadu(&a);
+        let vb = NeonI16::loadu(&b);
+        let mut exp_adds = [0i16; 8];
+        let mut exp_subs = [0i16; 8];
+        for (i, (&ai, &bi)) in a.iter().zip(b.iter()).enumerate() {
+            exp_adds[i] = ai.saturating_add(bi);
+            exp_subs[i] = ai.saturating_sub(bi);
+        }
+        assert_eq!(unpack16(NeonI16::adds(va, vb)), exp_adds);
+        assert_eq!(unpack16(NeonI16::subs(va, vb)), exp_subs);
+    }
+
+    #[test]
     fn i16_loadu_storeu_round_trip() {
         if !neon_available() {
             return;
@@ -892,6 +998,36 @@ mod tests {
         let one = NeonI32::splat(1);
         assert_eq!(unpack32(NeonI32::add(hi, one)), [i32::MIN; 4]);
         assert_eq!(unpack32(NeonI32::sub(lo, one)), [i32::MAX; 4]);
+    }
+
+    #[test]
+    fn i32_adds_subs_saturate_at_bounds() {
+        if !neon_available() {
+            return;
+        }
+        // adds/subs must clamp at the element bound (native `vqaddq_s32`/`vqsubq_s32`), unlike
+        // `add`/`sub` which wrap.
+        let hi = NeonI32::splat(i32::MAX);
+        let lo = NeonI32::splat(i32::MIN);
+        let one = NeonI32::splat(1);
+        assert_eq!(unpack32(NeonI32::adds(hi, one)), [i32::MAX; 4]);
+        assert_eq!(unpack32(NeonI32::subs(lo, one)), [i32::MIN; 4]);
+
+        // Lane-wise match against the scalar `saturating_add`/`saturating_sub` reference,
+        // including the exact `NEG_INF` sentinel repeatedly penalized (the banded fill's actual
+        // usage pattern).
+        let a = [3i32, i32::MAX, NeonI32::NEG_INF, -100];
+        let b = [1i32, 1, -128, -50];
+        let va = NeonI32::loadu(&a);
+        let vb = NeonI32::loadu(&b);
+        let mut exp_adds = [0i32; 4];
+        let mut exp_subs = [0i32; 4];
+        for (i, (&ai, &bi)) in a.iter().zip(b.iter()).enumerate() {
+            exp_adds[i] = ai.saturating_add(bi);
+            exp_subs[i] = ai.saturating_sub(bi);
+        }
+        assert_eq!(unpack32(NeonI32::adds(va, vb)), exp_adds);
+        assert_eq!(unpack32(NeonI32::subs(va, vb)), exp_subs);
     }
 
     #[test]

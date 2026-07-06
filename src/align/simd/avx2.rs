@@ -55,11 +55,12 @@
 
 use super::lanes::Simd;
 use core::arch::x86_64::{
-    __m256i, _mm256_add_epi16, _mm256_add_epi32, _mm256_alignr_epi8, _mm256_castsi256_si128,
-    _mm256_cvtepi16_epi32, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_max_epi16,
-    _mm256_max_epi32, _mm256_min_epi16, _mm256_min_epi32, _mm256_or_si256,
-    _mm256_permute2x128_si256, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_srli_si256,
-    _mm256_storeu_si256, _mm256_sub_epi16, _mm256_sub_epi32,
+    __m256i, _mm256_add_epi16, _mm256_add_epi32, _mm256_adds_epi16, _mm256_alignr_epi8,
+    _mm256_and_si256, _mm256_blendv_epi8, _mm256_castsi256_si128, _mm256_cvtepi16_epi32,
+    _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_max_epi16, _mm256_max_epi32,
+    _mm256_min_epi16, _mm256_min_epi32, _mm256_or_si256, _mm256_permute2x128_si256,
+    _mm256_set1_epi16, _mm256_set1_epi32, _mm256_srai_epi32, _mm256_srli_epi32, _mm256_srli_si256,
+    _mm256_storeu_si256, _mm256_sub_epi16, _mm256_sub_epi32, _mm256_subs_epi16, _mm256_xor_si256,
 };
 
 /// `i16::MIN + 1024`, this backend's `kNegativeInfinity` (see [`Simd::NEG_INF`]).
@@ -195,6 +196,27 @@ unsafe fn sub16(a: __m256i, b: __m256i) -> __m256i {
     _mm256_sub_epi16(a, b)
 }
 
+/// Lane-typed `i16` **saturating** add. Ports `_mm256_adds_epi16` — native saturating hardware
+/// support, unlike the int32 backend (see [`adds32`]) which AVX2 has no intrinsic for.
+///
+/// # Safety
+/// Caller must guarantee AVX2 is available (see the module-level Safety note).
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn adds16(a: __m256i, b: __m256i) -> __m256i {
+    _mm256_adds_epi16(a, b)
+}
+
+/// Lane-typed `i16` **saturating** sub. Ports `_mm256_subs_epi16`.
+///
+/// # Safety
+/// Caller must guarantee AVX2 is available (see the module-level Safety note).
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn subs16(a: __m256i, b: __m256i) -> __m256i {
+    _mm256_subs_epi16(a, b)
+}
+
 /// Lane-typed `i16` signed min. Ports `_mm256_min_epi16` (`impl:75`).
 ///
 /// # Safety
@@ -254,6 +276,18 @@ impl Simd for Avx2I16 {
     fn sub(a: __m256i, b: __m256i) -> __m256i {
         // SAFETY: see `splat`. Non-saturating `_mm256_sub_epi16`.
         unsafe { sub16(a, b) }
+    }
+
+    #[inline(always)]
+    fn adds(a: __m256i, b: __m256i) -> __m256i {
+        // SAFETY: see `splat`. Native saturating `_mm256_adds_epi16`.
+        unsafe { adds16(a, b) }
+    }
+
+    #[inline(always)]
+    fn subs(a: __m256i, b: __m256i) -> __m256i {
+        // SAFETY: see `splat`. Native saturating `_mm256_subs_epi16`.
+        unsafe { subs16(a, b) }
     }
 
     #[inline(always)]
@@ -372,6 +406,54 @@ unsafe fn sub32(a: __m256i, b: __m256i) -> __m256i {
     _mm256_sub_epi32(a, b)
 }
 
+/// The saturation target for an overflowing lane, keyed on `a`'s sign: `a >= 0 -> i32::MAX`,
+/// `a < 0 -> i32::MIN`. Shared by [`adds32`]/[`subs32`]; see [`super::sse41::saturation_target32`]
+/// (the identical formula, at half width) for the derivation.
+///
+/// # Safety
+/// Caller must guarantee AVX2 is available (see the module-level Safety note).
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn saturation_target32(a: __m256i) -> __m256i {
+    _mm256_add_epi32(_mm256_srli_epi32::<31>(a), _mm256_set1_epi32(i32::MAX))
+}
+
+/// Lane-typed `i32` **saturating** add: AVX2 has no `_mm256_adds_epi32` (only int16 saturates
+/// natively — see [`adds16`]), so this emulates it exactly as
+/// [`super::sse41::adds32`] does at double width: wrapping sum `r`, the signed-overflow test
+/// `(a ^ r) & (b ^ r) < 0`, `_mm256_srai_epi32::<31>` to broadcast that one sign bit across each
+/// whole 32-bit lane (`_mm256_blendv_epi8` blends per BYTE, not per lane — see the SSE4.1 sibling's
+/// doc for why the un-broadcast form corrupts most overflowing lanes), then blend in
+/// [`saturation_target32`] on overflow.
+///
+/// # Safety
+/// Caller must guarantee AVX2 is available (see the module-level Safety note).
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn adds32(a: __m256i, b: __m256i) -> __m256i {
+    let r = _mm256_add_epi32(a, b);
+    let sat = saturation_target32(a);
+    let overflow = _mm256_and_si256(_mm256_xor_si256(a, r), _mm256_xor_si256(b, r));
+    let overflow_mask = _mm256_srai_epi32::<31>(overflow);
+    _mm256_blendv_epi8(r, sat, overflow_mask)
+}
+
+/// Lane-typed `i32` **saturating** sub; see [`adds32`] for the emulation rationale (no native
+/// `_mm256_subs_epi32`). Overflow test is the signed-subtraction form `(a ^ b) & (a ^ r) < 0`; see
+/// [`super::sse41::subs32`] for the derivation.
+///
+/// # Safety
+/// Caller must guarantee AVX2 is available (see the module-level Safety note).
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn subs32(a: __m256i, b: __m256i) -> __m256i {
+    let r = _mm256_sub_epi32(a, b);
+    let sat = saturation_target32(a);
+    let overflow = _mm256_and_si256(_mm256_xor_si256(a, b), _mm256_xor_si256(a, r));
+    let overflow_mask = _mm256_srai_epi32::<31>(overflow);
+    _mm256_blendv_epi8(r, sat, overflow_mask)
+}
+
 /// Lane-typed `i32` signed min. Ports `_mm256_min_epi32` (`impl:111`).
 ///
 /// # Safety
@@ -430,6 +512,18 @@ impl Simd for Avx2I32 {
     fn sub(a: __m256i, b: __m256i) -> __m256i {
         // SAFETY: see `splat`. Non-saturating `_mm256_sub_epi32`.
         unsafe { sub32(a, b) }
+    }
+
+    #[inline(always)]
+    fn adds(a: __m256i, b: __m256i) -> __m256i {
+        // SAFETY: see `splat`. Emulated saturating add (no native `_mm256_adds_epi32`).
+        unsafe { adds32(a, b) }
+    }
+
+    #[inline(always)]
+    fn subs(a: __m256i, b: __m256i) -> __m256i {
+        // SAFETY: see `splat`. Emulated saturating sub (no native `_mm256_subs_epi32`).
+        unsafe { subs32(a, b) }
     }
 
     #[inline(always)]
@@ -665,6 +759,50 @@ mod tests {
     }
 
     #[test]
+    fn i16_adds_subs_saturate_at_bounds() {
+        if !avx2_available() {
+            return;
+        }
+        // adds/subs must clamp (native `_mm256_adds_epi16`/`_mm256_subs_epi16`), unlike add/sub,
+        // which wrap.
+        let hi = Avx2I16::splat(i16::MAX);
+        let lo = Avx2I16::splat(i16::MIN);
+        let one = Avx2I16::splat(1);
+        assert_eq!(unpack16(Avx2I16::adds(hi, one)), [i16::MAX; 16]);
+        assert_eq!(unpack16(Avx2I16::subs(lo, one)), [i16::MIN; 16]);
+
+        let a = [
+            3i16,
+            i16::MAX,
+            -2,
+            i16::MIN,
+            0,
+            i16::MAX - 1,
+            -100,
+            i16::MIN + 1,
+            9,
+            -8,
+            11,
+            -6,
+            13,
+            -1,
+            15,
+            -3,
+        ];
+        let b = [1i16, 1, -3, -1, -5, 2, -50, -2, 2, 2, -7, 8, -9, 3, 4, -2];
+        let va = Avx2I16::loadu(&a);
+        let vb = Avx2I16::loadu(&b);
+        let mut exp_adds = [0i16; 16];
+        let mut exp_subs = [0i16; 16];
+        for (i, (&ai, &bi)) in a.iter().zip(b.iter()).enumerate() {
+            exp_adds[i] = ai.saturating_add(bi);
+            exp_subs[i] = ai.saturating_sub(bi);
+        }
+        assert_eq!(unpack16(Avx2I16::adds(va, vb)), exp_adds);
+        assert_eq!(unpack16(Avx2I16::subs(va, vb)), exp_subs);
+    }
+
+    #[test]
     fn i16_loadu_storeu_round_trip() {
         if !avx2_available() {
             return;
@@ -850,6 +988,64 @@ mod tests {
         let one = Avx2I32::splat(1);
         assert_eq!(unpack32(Avx2I32::add(hi, one)), [i32::MIN; 8]);
         assert_eq!(unpack32(Avx2I32::sub(lo, one)), [i32::MAX; 8]);
+    }
+
+    /// AVX2 has no native `_mm256_adds_epi32`/`_mm256_subs_epi32` (see [`super::adds32`]/
+    /// [`super::subs32`]), so — mirroring the SSE4.1 sibling test — this is the check that
+    /// actually exercises the emulation against the scalar `saturating_add`/`saturating_sub`
+    /// oracle: boundary values plus a wide pseudo-random sweep.
+    #[test]
+    fn i32_adds_subs_saturate_at_bounds() {
+        if !avx2_available() {
+            return;
+        }
+        let hi = Avx2I32::splat(i32::MAX);
+        let lo = Avx2I32::splat(i32::MIN);
+        let one = Avx2I32::splat(1);
+        assert_eq!(unpack32(Avx2I32::adds(hi, one)), [i32::MAX; 8]);
+        assert_eq!(unpack32(Avx2I32::subs(lo, one)), [i32::MIN; 8]);
+
+        let neg = Avx2I32::NEG_INF;
+        let a = [3i32, i32::MAX, neg, -100, 9, -8, 700, -6];
+        let b = [1i32, 1, -128, -50, -5, 2, 600, -1];
+        let va = Avx2I32::loadu(&a);
+        let vb = Avx2I32::loadu(&b);
+        let mut exp_adds = [0i32; 8];
+        let mut exp_subs = [0i32; 8];
+        for (i, (&ai, &bi)) in a.iter().zip(b.iter()).enumerate() {
+            exp_adds[i] = ai.saturating_add(bi);
+            exp_subs[i] = ai.saturating_sub(bi);
+        }
+        assert_eq!(unpack32(Avx2I32::adds(va, vb)), exp_adds);
+        assert_eq!(unpack32(Avx2I32::subs(va, vb)), exp_subs);
+
+        // Pseudo-random sweep (xorshift, no external RNG dependency) covering the full `i32`
+        // range, including many overflow/underflow-triggering combinations.
+        let mut state: u32 = 0x9E37_79B9;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as i32
+        };
+        for _ in 0..10_000 {
+            let a: [i32; 8] = std::array::from_fn(|_| next());
+            let b: [i32; 8] = std::array::from_fn(|_| next());
+            let va = Avx2I32::loadu(&a);
+            let vb = Avx2I32::loadu(&b);
+            let exp_adds: [i32; 8] = std::array::from_fn(|i| a[i].saturating_add(b[i]));
+            let exp_subs: [i32; 8] = std::array::from_fn(|i| a[i].saturating_sub(b[i]));
+            assert_eq!(
+                unpack32(Avx2I32::adds(va, vb)),
+                exp_adds,
+                "adds mismatch for {a:?} + {b:?}"
+            );
+            assert_eq!(
+                unpack32(Avx2I32::subs(va, vb)),
+                exp_subs,
+                "subs mismatch for {a:?} - {b:?}"
+            );
+        }
     }
 
     #[test]
