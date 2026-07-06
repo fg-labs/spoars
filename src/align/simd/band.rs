@@ -41,6 +41,66 @@ impl BandConfig {
     }
 }
 
+/// Remaining heaviest-support path length per rank: `R[sink] = 0`, and for every other node `n`,
+/// `R[n] = 1 + R[s*]` where `s*` is the successor reached by `n`'s heaviest out-edge (max
+/// [`crate::graph::Edge::weight`], ties broken by the **lowest rank** among tied successors, for
+/// determinism across runs/ISAs — the same cross-run/ISA-parity concern the SIMD kernels are
+/// built around applies here too). Computed in a single reverse topological pass
+/// (`graph.rank_order()` reversed), which is well-founded since every out-edge points to a
+/// strictly-later rank on the DAG.
+///
+/// Returned `Vec` is indexed **by rank**, not by [`crate::graph::NodeId`] — use
+/// `node_id_to_rank[node_id.0 as usize]` to look up a specific node's `R`.
+///
+/// # Heuristic bias (documented tradeoff, not a bug)
+/// This counts *nodes* on the heaviest-support path as a proxy for query *columns* remaining. If
+/// the query has indels relative to that path, the true number of query columns left from a given
+/// node can differ from `R[n]`; the anchor derived from `R` via [`anchor`] absorbs that slack via
+/// [`BandConfig`]'s half-width rather than tracking it exactly. This mirrors abPOA's own banding
+/// heuristic.
+// Not yet called outside this module's own tests: a later banded-POA task wires this into the
+// SIMD fill's band-derivation step (see `ScalarInit`'s identical `#[allow(dead_code)]` rationale
+// in `sisd.rs`).
+#[allow(dead_code)]
+pub(crate) fn remaining_path(graph: &crate::graph::Graph, node_id_to_rank: &[u32]) -> Vec<u32> {
+    let rank_to_node = graph.rank_order();
+    let mut r = vec![0u32; rank_to_node.len()];
+    for &node_id in rank_to_node.iter().rev() {
+        let node = graph.node(node_id);
+        let rank = node_id_to_rank[node_id.0 as usize] as usize;
+
+        // Heaviest out-edge, ties broken by lowest successor rank.
+        let mut best: Option<(i64, usize)> = None; // (weight, successor's rank)
+        for &edge_id in &node.outedges {
+            let edge = graph.edge(edge_id);
+            let succ_rank = node_id_to_rank[edge.head.0 as usize] as usize;
+            let better = match best {
+                None => true,
+                Some((best_weight, best_rank)) => {
+                    edge.weight > best_weight
+                        || (edge.weight == best_weight && succ_rank < best_rank)
+                }
+            };
+            if better {
+                best = Some((edge.weight, succ_rank));
+            }
+        }
+
+        r[rank] = best.map_or(0, |(_, succ_rank)| 1 + r[succ_rank]);
+    }
+    r
+}
+
+/// Query-column anchor for a node with remaining-path length `r_len`: `clamp(L - r_len, 0, L)`
+/// where `L = query_len`. `saturating_sub` alone already yields a value in `[0, L]` (it cannot
+/// underflow past 0, and subtracting a non-negative amount from `L` cannot exceed `L`), so no
+/// separate upper clamp is needed.
+// See `remaining_path`'s identical `#[allow(dead_code)]` rationale immediately above.
+#[allow(dead_code)]
+pub(crate) fn anchor(r_len: u32, query_len: usize) -> usize {
+    query_len.saturating_sub(r_len as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +140,103 @@ mod tests {
     fn default_is_abpoa() {
         assert_eq!(BandConfig::default().base, 10);
         assert!((BandConfig::default().frac - 0.01).abs() < 1e-9);
+    }
+
+    // ---- remaining_path / anchor fixtures & tests --------------------------------------------
+
+    use crate::graph::{Graph, NodeId};
+
+    /// Inverts `graph.rank_order()` into a `node_id -> rank` lookup, the same shape
+    /// `ScalarInit::node_id_to_rank` hands the real fill (see `sisd.rs`'s
+    /// `node_id_to_rank[node_id.0 as usize] = rank as u32` seeding loop).
+    fn node_id_to_rank_from(graph: &Graph) -> Vec<u32> {
+        let mut node_id_to_rank = vec![0u32; graph.num_nodes()];
+        for (rank, &node_id) in graph.rank_order().iter().enumerate() {
+            node_id_to_rank[node_id.0 as usize] = rank as u32;
+        }
+        node_id_to_rank
+    }
+
+    /// Linear chain `A -> C -> G`, built the same way as `graph::tests::public_accessors_...`'s
+    /// single fresh sequence: one `add_alignment` call with an empty alignment.
+    fn linear_chain_3() -> (Graph, Vec<u32>) {
+        let mut graph = Graph::new();
+        graph.add_alignment(&[], b"ACG", &[1, 1, 1]).unwrap();
+        let node_id_to_rank = node_id_to_rank_from(&graph);
+        (graph, node_id_to_rank)
+    }
+
+    /// Diamond `A -> X -> Z -> C` (longer branch) and `A -> Y -> C` (shorter branch), both
+    /// reconverging at `C`. The two edges leaving `A` (`A->X`, `A->Y`) carry equal weight, so
+    /// `remaining_path` can only pick a successor deterministically by falling back to the
+    /// lowest-ranked one. Node ids are assigned in add order: `A=0, X=1, Z=2, C=3, Y=4` (`Y` is
+    /// the only node the second `add_alignment` call creates fresh; `A` and `C` are matched onto
+    /// the existing nodes from the first sequence).
+    fn diamond_equal_weights() -> (Graph, Vec<u32>) {
+        let mut graph = Graph::new();
+        graph.add_alignment(&[], b"AXZC", &[1, 1, 1, 1]).unwrap();
+        graph
+            .add_alignment(&[(0, 0), (-1, 1), (3, 2)], b"AYC", &[1, 1, 1])
+            .unwrap();
+        let node_id_to_rank = node_id_to_rank_from(&graph);
+        (graph, node_id_to_rank)
+    }
+
+    #[test]
+    fn remaining_path_counts_heaviest_successor_chain() {
+        let (graph, node_id_to_rank) = linear_chain_3();
+        let r = remaining_path(&graph, &node_id_to_rank);
+        // sink has R=0; each predecessor is 1 + successor's R.
+        assert_eq!(r[2], 0);
+        assert_eq!(r[1], 1);
+        assert_eq!(r[0], 2);
+    }
+
+    #[test]
+    fn anchor_clamps_to_query_bounds() {
+        assert_eq!(anchor(0, 235), 235); // sink -> end of query
+        assert_eq!(anchor(2, 235), 233);
+        assert_eq!(anchor(1000, 235), 0); // R > L clamps to 0
+    }
+
+    #[test]
+    fn remaining_path_tie_breaks_by_lowest_rank() {
+        // A node with two equal-weight out-edges must pick the successor with the LOWEST rank,
+        // so R is deterministic across runs/ISAs.
+        let (graph, node_id_to_rank) = diamond_equal_weights();
+        let r = remaining_path(&graph, &node_id_to_rank);
+
+        let a_rank = node_id_to_rank[NodeId(0).0 as usize] as usize; // A
+        let x_rank = node_id_to_rank[NodeId(1).0 as usize] as usize; // X (longer branch)
+        let y_rank = node_id_to_rank[NodeId(4).0 as usize] as usize; // Y (shorter branch)
+        assert!(
+            x_rank < y_rank,
+            "fixture invariant: X must rank lower than Y for this to test the tie-break"
+        );
+
+        // The branches differ in length (X's is one node longer than Y's), so picking the
+        // lower-ranked successor (X) versus the higher-ranked one (Y) is numerically
+        // distinguishable here — this is what makes the assertion below a real tie-break check,
+        // not a coincidence.
+        assert_eq!(
+            r[a_rank],
+            1 + r[x_rank],
+            "A must route through X (lower rank), not Y"
+        );
+        assert_ne!(
+            r[a_rank],
+            1 + r[y_rank],
+            "A must not route through Y (higher rank)"
+        );
+
+        // Exact expected R, hand-derived from the fixture: C (sink) = 0; Y = 1; Z = 1;
+        // X = 1 + R[Z] = 2; A = 1 + R[X] (tie-break picks X) = 3.
+        let c_rank = node_id_to_rank[NodeId(3).0 as usize] as usize;
+        let z_rank = node_id_to_rank[NodeId(2).0 as usize] as usize;
+        assert_eq!(r[c_rank], 0);
+        assert_eq!(r[y_rank], 1);
+        assert_eq!(r[z_rank], 1);
+        assert_eq!(r[x_rank], 2);
+        assert_eq!(r[a_rank], 3);
     }
 }
