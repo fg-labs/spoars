@@ -158,6 +158,12 @@ where
 // `vzeroupper` ~10% on AVX2 — precisely why AVX2 trailed SSE4.1). Forcing the inline folds the whole
 // destripe into the `run_avx2_*`/`run_sse41_*` target_feature entry so the 256-bit stores inline and
 // the transitions vanish. Output is unchanged.
+//
+// Retained as the tested reference for the striped -> row-major cell mapping: the SIMD backtrack no
+// longer destripes the whole interior (it reads the striped fill on demand via `super::StripedView`,
+// which uses this exact mapping), so this function is now exercised only by its unit tests below,
+// which pin that mapping. `#[allow(dead_code)]` because those tests are its only callers.
+#[allow(dead_code)]
 #[inline(always)]
 pub(crate) fn destripe_interior<S>(
     dst: &mut [i32],

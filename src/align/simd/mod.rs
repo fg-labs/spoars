@@ -26,6 +26,7 @@ mod profile;
 #[cfg(target_arch = "x86_64")]
 mod sse41;
 
+use crate::align::backtrack::CellRead;
 use crate::align::sisd::ScalarInit;
 use crate::align::{Alignment, AlignmentEngine, AlignmentType, Scoring, SisdEngine};
 use crate::graph::Graph;
@@ -445,9 +446,9 @@ where
     S: lanes::Simd,
     S::Elem: profile::ElemFromI32 + profile::ElemToI32,
 {
-    use crate::align::backtrack::backtrack_linear;
+    use crate::align::backtrack::backtrack_linear_impl;
     use crate::align::sisd::reseed_scalar_buffers;
-    use profile::{build_masks, build_penalties, build_profile, destripe_interior, ElemFromI32};
+    use profile::{build_masks, build_penalties, build_profile, ElemFromI32};
 
     reseed_scalar_buffers(seeded, alignment_type, scoring, seq, graph);
     build_profile::<S>(&mut striped.profile, graph, seq, scoring);
@@ -472,21 +473,20 @@ where
         &mut striped.h,
     );
 
-    // Destripe only the interior rows (rows 1..); row 0 of `striped.h` is the boundary already in
-    // `seeded.h`, which `destripe_interior` never touches.
+    // Prototype (option 1): skip the destripe; read the striped H directly via `StripedView`.
     let matrix_width_vecs = seq.len().div_ceil(S::LANES);
-    destripe_interior::<S>(
-        &mut seeded.h,
-        &striped.h[matrix_width_vecs..],
-        matrix_width_vecs,
-        seq.len(),
-    );
+    let h_view = StripedView::<S> {
+        boundary: &seeded.h,
+        striped: &striped.h,
+        width_scalar: seeded.matrix_width,
+        width_vecs: matrix_width_vecs,
+    };
 
-    let alignment = backtrack_linear(
+    let alignment = backtrack_linear_impl(
         graph,
         &seeded.node_id_to_rank,
         &seeded.sequence_profile,
-        &seeded.h,
+        &h_view,
         seeded.matrix_width,
         alignment_type,
         &scoring,
@@ -525,9 +525,9 @@ where
     S: lanes::Simd,
     S::Elem: profile::ElemFromI32 + profile::ElemToI32,
 {
-    use crate::align::backtrack::backtrack_affine;
+    use crate::align::backtrack::backtrack_affine_impl;
     use crate::align::sisd::reseed_scalar_buffers;
-    use profile::{build_masks, build_penalties, build_profile, destripe_interior, ElemFromI32};
+    use profile::{build_masks, build_penalties, build_profile, ElemFromI32};
 
     reseed_scalar_buffers(seeded, alignment_type, scoring, seq, graph);
     build_profile::<S>(&mut striped.profile, graph, seq, scoring);
@@ -553,35 +553,35 @@ where
         &mut striped.f,
     );
 
-    // Destripe only the interior rows (rows 1..); row 0 is the boundary already in the seeded
-    // buffers, which `destripe_interior` never touches.
+    // Prototype (option 1): skip the destripe; read the striped H/E/F directly via `StripedView`.
     let matrix_width_vecs = seq.len().div_ceil(S::LANES);
-    destripe_interior::<S>(
-        &mut seeded.h,
-        &striped.h[matrix_width_vecs..],
-        matrix_width_vecs,
-        seq.len(),
-    );
-    destripe_interior::<S>(
-        &mut seeded.e,
-        &striped.e[matrix_width_vecs..],
-        matrix_width_vecs,
-        seq.len(),
-    );
-    destripe_interior::<S>(
-        &mut seeded.f,
-        &striped.f[matrix_width_vecs..],
-        matrix_width_vecs,
-        seq.len(),
-    );
+    let width_scalar = seeded.matrix_width;
+    let h_view = StripedView::<S> {
+        boundary: &seeded.h,
+        striped: &striped.h,
+        width_scalar,
+        width_vecs: matrix_width_vecs,
+    };
+    let e_view = StripedView::<S> {
+        boundary: &seeded.e,
+        striped: &striped.e,
+        width_scalar,
+        width_vecs: matrix_width_vecs,
+    };
+    let f_view = StripedView::<S> {
+        boundary: &seeded.f,
+        striped: &striped.f,
+        width_scalar,
+        width_vecs: matrix_width_vecs,
+    };
 
-    let alignment = backtrack_affine(
+    let alignment = backtrack_affine_impl(
         graph,
         &seeded.node_id_to_rank,
         &seeded.sequence_profile,
-        &seeded.h,
-        &seeded.e,
-        &seeded.f,
+        &h_view,
+        &e_view,
+        &f_view,
         seeded.matrix_width,
         alignment_type,
         &scoring,
@@ -592,6 +592,48 @@ where
     (alignment, max_score)
 }
 
+/// A [`CellRead`] view over a striped fill matrix, so the convex backtrack can index the striped
+/// `H`/`E`/`F`/`O`/`Q` directly instead of destriping the whole interior first (prototype for the
+/// "skip the full-matrix destripe" optimization). Interior cells (`i >= 1`, `j >= 1`) are read from
+/// the striped buffer with the same lane mapping [`profile::destripe_interior`] uses; boundary cells
+/// (`i == 0` or `j == 0`) are read from `boundary`, the scalar-seeded row-major buffer whose row 0
+/// and column 0 [`reseed_scalar_buffers`] already fills.
+struct StripedView<'a, S: lanes::Simd>
+where
+    S::Elem: profile::ElemFromI32 + profile::ElemToI32,
+{
+    /// Scalar-seeded row-major buffer; only its row 0 and column 0 are read.
+    boundary: &'a [i32],
+    /// Full striped matrix, graph row `i`'s block at `[i * width_vecs ..]` (row 0 is the boundary).
+    striped: &'a [S::Vec],
+    /// Row-major width, `seq_len + 1`.
+    width_scalar: usize,
+    /// Striped width in vectors, `ceil(seq_len / LANES)`.
+    width_vecs: usize,
+}
+
+impl<S: lanes::Simd> CellRead for StripedView<'_, S>
+where
+    S::Elem: profile::ElemFromI32 + profile::ElemToI32,
+{
+    #[inline(always)]
+    fn get(&self, i: usize, j: usize) -> i32 {
+        if i == 0 || j == 0 {
+            return self.boundary[i * self.width_scalar + j];
+        }
+        let lanes = <S as lanes::Simd>::LANES;
+        let pos = j - 1; // 0-based query position
+        let seg = pos / lanes;
+        let lane = pos % lanes;
+        // Extract one lane of the striped cell, widened to i32. `LANES <= 32` for every backend
+        // (max 16 for AVX2 int16), so a fixed 32-wide stack buffer avoids a per-cell heap alloc.
+        debug_assert!(lanes <= 32);
+        let mut buf = [<S::Elem as profile::ElemFromI32>::from_i32(0); 32];
+        <S as lanes::Simd>::storeu(self.striped[i * self.width_vecs + seg], &mut buf[..lanes]);
+        <S::Elem as profile::ElemToI32>::to_i32(buf[lane])
+    }
+}
+
 /// Runs the vectorized **convex-gap** fill pipeline for `seq` against `graph`, returning the same
 /// `(Alignment, i32)` a [`SisdEngine`] would (the SIMD kernels plan's bit-exactness contract).
 /// Wired for all three [`AlignmentType`]s — Global/NW (SIMD kernels plan Task 10a) and Local/SW +
@@ -599,11 +641,11 @@ where
 /// [`fill::fill_linear`]/[`fill::fill_affine`]'s (proven in Tasks 8 and 9b). Generic over the lane
 /// backend `S` exactly as [`align_simd_linear`] is (SSE4.1 or NEON, int16 or int32).
 ///
-/// The pipeline mirrors [`align_simd_affine`] but adds the SECOND affine function's matrices: it
-/// destripes all five of H, E, F, **O and Q** over the seeded buffers and backtracks via
-/// [`crate::align::backtrack::backtrack_convex`]. Two prefix-max penalty ladders are built — one
-/// from the first extend `e` (for the `E` ladder) and one from the second extend `c` (for the `Q`
-/// ladder), matching upstream (`simd_alignment_engine_implementation.hpp:1559-1565`).
+/// The pipeline mirrors [`align_simd_affine`] but adds the SECOND affine function's matrices; the
+/// prototype reads all five of H, E, F, **O and Q** striped (via [`StripedView`]) instead of
+/// destriping. Two prefix-max penalty ladders are built — one from the first extend `e` (for the
+/// `E` ladder) and one from the second extend `c` (for the `Q` ladder), matching upstream
+/// (`simd_alignment_engine_implementation.hpp:1559-1565`).
 ///
 /// Only reached after the caller's runtime ISA feature check selected an ISA whose `target_feature`
 /// code inside `S` is therefore sound (see [`align_simd_linear`]).
@@ -621,9 +663,9 @@ where
     S: lanes::Simd,
     S::Elem: profile::ElemFromI32 + profile::ElemToI32,
 {
-    use crate::align::backtrack::backtrack_convex;
+    use crate::align::backtrack::backtrack_convex_impl;
     use crate::align::sisd::reseed_scalar_buffers;
-    use profile::{build_masks, build_penalties, build_profile, destripe_interior, ElemFromI32};
+    use profile::{build_masks, build_penalties, build_profile, ElemFromI32};
 
     reseed_scalar_buffers(seeded, alignment_type, scoring, seq, graph);
     build_profile::<S>(&mut striped.profile, graph, seq, scoring);
@@ -654,28 +696,52 @@ where
         &mut striped.q,
     );
 
-    // Destripe only the interior rows (rows 1..); row 0 is the boundary already in the seeded
-    // buffers, which `destripe_interior` never touches.
+    // Prototype (option 1): skip the full-matrix destripe. Row 0 / column 0 are already the
+    // scalar boundary in the seeded buffers (`reseed_scalar_buffers`); the interior stays striped
+    // and is read on demand through `StripedView`, so the backtrack touches only the cells along
+    // its (short) path instead of paying an O(rows*cols) transpose per matrix (x5 for convex).
     let matrix_width_vecs = seq.len().div_ceil(S::LANES);
-    for (dst, src) in [
-        (&mut seeded.h, &striped.h),
-        (&mut seeded.e, &striped.e),
-        (&mut seeded.f, &striped.f),
-        (&mut seeded.o, &striped.o),
-        (&mut seeded.q, &striped.q),
-    ] {
-        destripe_interior::<S>(dst, &src[matrix_width_vecs..], matrix_width_vecs, seq.len());
-    }
+    let width_scalar = seeded.matrix_width;
+    let h_view = StripedView::<S> {
+        boundary: &seeded.h,
+        striped: &striped.h,
+        width_scalar,
+        width_vecs: matrix_width_vecs,
+    };
+    let e_view = StripedView::<S> {
+        boundary: &seeded.e,
+        striped: &striped.e,
+        width_scalar,
+        width_vecs: matrix_width_vecs,
+    };
+    let f_view = StripedView::<S> {
+        boundary: &seeded.f,
+        striped: &striped.f,
+        width_scalar,
+        width_vecs: matrix_width_vecs,
+    };
+    let o_view = StripedView::<S> {
+        boundary: &seeded.o,
+        striped: &striped.o,
+        width_scalar,
+        width_vecs: matrix_width_vecs,
+    };
+    let q_view = StripedView::<S> {
+        boundary: &seeded.q,
+        striped: &striped.q,
+        width_scalar,
+        width_vecs: matrix_width_vecs,
+    };
 
-    let alignment = backtrack_convex(
+    let alignment = backtrack_convex_impl(
         graph,
         &seeded.node_id_to_rank,
         &seeded.sequence_profile,
-        &seeded.h,
-        &seeded.e,
-        &seeded.f,
-        &seeded.o,
-        &seeded.q,
+        &h_view,
+        &e_view,
+        &f_view,
+        &o_view,
+        &q_view,
         seeded.matrix_width,
         alignment_type,
         &scoring,
