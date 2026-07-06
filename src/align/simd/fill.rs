@@ -32,6 +32,7 @@
 //! The caller ([`super::SimdEngine`]) then [`super::profile::destripe_interior`]s the returned
 //! striped `H` over the seeded row-major buffer and runs [`crate::align::backtrack::backtrack_linear`].
 
+use super::band::BandState;
 use super::lanes::Simd;
 use super::profile::{ElemFromI32, ElemToI32};
 use crate::align::sisd::{ScalarInit, NEG_INF};
@@ -153,6 +154,9 @@ fn seed_striped_row0<S>(
 ///
 /// The caller guarantees `seq_len >= 1` and a non-empty `graph` (both short-circuited earlier in
 /// [`super::SimdEngine::align`]), so `matrix_width_vecs >= 1`.
+///
+/// `band` is plumbing for the (not-yet-active) banded fill: `None` reproduces today's full-matrix
+/// behavior exactly; it is otherwise unused for now.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) fn fill_linear<S>(
@@ -165,11 +169,13 @@ pub(crate) fn fill_linear<S>(
     masks: &[S::Vec],
     penalties: &[S::Vec],
     striped_h: &mut Vec<S::Vec>,
+    band: Option<&mut BandState>,
 ) -> (usize, usize, i32)
 where
     S: Simd,
     S::Elem: ElemFromI32 + ElemToI32,
 {
+    let _ = &band;
     let lanes = S::LANES;
     let matrix_width_vecs = seq_len.div_ceil(lanes);
     let matrix_width = seeded.matrix_width; // seq_len + 1 (row-major width)
@@ -356,6 +362,9 @@ where
 /// - **H = max(H, F, E)** then per-type max tracking (`impl:1191,1203,1208-1238`): NW takes the
 ///   last query column's value at each sink node; SW/OV reduce rows (OV via the unclamped
 ///   [`row_max`], see its doc — mirrored from [`fill_linear`] so Task 9b's SW/OV branch is correct).
+///
+/// `band` is plumbing for the (not-yet-active) banded fill: `None` reproduces today's full-matrix
+/// behavior exactly; it is otherwise unused for now.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) fn fill_affine<S>(
@@ -370,11 +379,13 @@ pub(crate) fn fill_affine<S>(
     striped_h: &mut Vec<S::Vec>,
     striped_e: &mut Vec<S::Vec>,
     striped_f: &mut Vec<S::Vec>,
+    band: Option<&mut BandState>,
 ) -> (usize, usize, i32)
 where
     S: Simd,
     S::Elem: ElemFromI32 + ElemToI32,
 {
+    let _ = &band;
     let lanes = S::LANES;
     let matrix_width_vecs = seq_len.div_ceil(lanes);
     let matrix_width = seeded.matrix_width; // seq_len + 1 (row-major width)
@@ -567,6 +578,9 @@ where
 ///   column's value at each sink node; SW/OV reduce rows (OV via the unclamped [`row_max`], see its
 ///   doc). All three types are wired: Global/NW (Task 10a) and Local/SW + Overlap/OV (Task 10b) —
 ///   this completes the full SSE4.1 int16 engine (all 9 gap-mode x alignment-type combinations).
+///
+/// `band` is plumbing for the (not-yet-active) banded fill: `None` reproduces today's full-matrix
+/// behavior exactly; it is otherwise unused for now.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) fn fill_convex<S>(
@@ -584,11 +598,13 @@ pub(crate) fn fill_convex<S>(
     striped_f: &mut Vec<S::Vec>,
     striped_o: &mut Vec<S::Vec>,
     striped_q: &mut Vec<S::Vec>,
+    band: Option<&mut BandState>,
 ) -> (usize, usize, i32)
 where
     S: Simd,
     S::Elem: ElemFromI32 + ElemToI32,
 {
+    let _ = &band;
     let lanes = S::LANES;
     let matrix_width_vecs = seq_len.div_ceil(lanes);
     let matrix_width = seeded.matrix_width; // seq_len + 1 (row-major width)

@@ -33,6 +33,7 @@ use crate::align::backtrack::CellRead;
 use crate::align::sisd::ScalarInit;
 use crate::align::{Alignment, AlignmentEngine, AlignmentType, Scoring, SisdEngine};
 use crate::graph::Graph;
+use band::BandState;
 
 /// The reused-across-`align`-calls **striped** SIMD scratch for one concrete register type `V`
 /// (`__m128i`/`__m256i`/`int16x8_t`/`int32x4_t`): the striped char profile, the up-to-five striped
@@ -435,6 +436,9 @@ impl SimdEngine {
 /// Only reached after the caller's runtime feature check (`is_x86_feature_detected!("sse4.1")` for
 /// [`Isa::Sse41`], `is_aarch64_feature_detected!("neon")` for [`Isa::Neon`]) selected an ISA whose
 /// `target_feature` code inside `S` is therefore sound (see each backend's module Safety note).
+///
+/// `band` is plumbing for the (not-yet-active) banded fill: `None` reproduces today's full-matrix
+/// behavior exactly; it is otherwise unused for now.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn align_simd_linear<S>(
@@ -444,6 +448,7 @@ fn align_simd_linear<S>(
     graph: &Graph,
     seeded: &mut ScalarInit,
     striped: &mut StripedBuffers<S::Vec>,
+    band: Option<&mut BandState>,
 ) -> (Alignment, i32)
 where
     S: lanes::Simd,
@@ -474,6 +479,7 @@ where
         &striped.masks,
         &striped.penalties,
         &mut striped.h,
+        band,
     );
 
     // Prototype (option 1): skip the destripe; read the striped H directly via `StripedView`.
@@ -514,6 +520,9 @@ where
 ///
 /// Only reached after the caller's runtime ISA feature check selected an ISA whose `target_feature`
 /// code inside `S` is therefore sound (see [`align_simd_linear`]).
+///
+/// `band` is plumbing for the (not-yet-active) banded fill: `None` reproduces today's full-matrix
+/// behavior exactly; it is otherwise unused for now.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn align_simd_affine<S>(
@@ -523,6 +532,7 @@ fn align_simd_affine<S>(
     graph: &Graph,
     seeded: &mut ScalarInit,
     striped: &mut StripedBuffers<S::Vec>,
+    band: Option<&mut BandState>,
 ) -> (Alignment, i32)
 where
     S: lanes::Simd,
@@ -554,6 +564,7 @@ where
         &mut striped.h,
         &mut striped.e,
         &mut striped.f,
+        band,
     );
 
     // Prototype (option 1): skip the destripe; read the striped H/E/F directly via `StripedView`.
@@ -652,6 +663,9 @@ where
 ///
 /// Only reached after the caller's runtime ISA feature check selected an ISA whose `target_feature`
 /// code inside `S` is therefore sound (see [`align_simd_linear`]).
+///
+/// `band` is plumbing for the (not-yet-active) banded fill: `None` reproduces today's full-matrix
+/// behavior exactly; it is otherwise unused for now.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn align_simd_convex<S>(
@@ -661,6 +675,7 @@ fn align_simd_convex<S>(
     graph: &Graph,
     seeded: &mut ScalarInit,
     striped: &mut StripedBuffers<S::Vec>,
+    band: Option<&mut BandState>,
 ) -> (Alignment, i32)
 where
     S: lanes::Simd,
@@ -697,6 +712,7 @@ where
         &mut striped.f,
         &mut striped.o,
         &mut striped.q,
+        band,
     );
 
     // Prototype (option 1): skip the full-matrix destripe. Row 0 / column 0 are already the
@@ -788,12 +804,13 @@ macro_rules! define_simd_runners {
             graph: &Graph,
             seeded: &mut ScalarInit,
             striped: &mut StripedBuffers<S::Vec>,
+            band: Option<&mut BandState>,
         ) -> (Alignment, i32)
         where
             S: lanes::Simd,
             S::Elem: profile::ElemFromI32 + profile::ElemToI32,
         {
-            align_simd_linear::<S>(alignment_type, scoring, seq, graph, seeded, striped)
+            align_simd_linear::<S>(alignment_type, scoring, seq, graph, seeded, striped, band)
         }
 
         #[cfg(target_arch = $arch)]
@@ -805,12 +822,13 @@ macro_rules! define_simd_runners {
             graph: &Graph,
             seeded: &mut ScalarInit,
             striped: &mut StripedBuffers<S::Vec>,
+            band: Option<&mut BandState>,
         ) -> (Alignment, i32)
         where
             S: lanes::Simd,
             S::Elem: profile::ElemFromI32 + profile::ElemToI32,
         {
-            align_simd_affine::<S>(alignment_type, scoring, seq, graph, seeded, striped)
+            align_simd_affine::<S>(alignment_type, scoring, seq, graph, seeded, striped, band)
         }
 
         #[cfg(target_arch = $arch)]
@@ -822,12 +840,13 @@ macro_rules! define_simd_runners {
             graph: &Graph,
             seeded: &mut ScalarInit,
             striped: &mut StripedBuffers<S::Vec>,
+            band: Option<&mut BandState>,
         ) -> (Alignment, i32)
         where
             S: lanes::Simd,
             S::Elem: profile::ElemFromI32 + profile::ElemToI32,
         {
-            align_simd_convex::<S>(alignment_type, scoring, seq, graph, seeded, striped)
+            align_simd_convex::<S>(alignment_type, scoring, seq, graph, seeded, striped, band)
         }
     };
 }
@@ -911,6 +930,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                             GapMode::Affine => unsafe {
@@ -921,6 +941,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                             GapMode::Convex => unsafe {
@@ -931,6 +952,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                         }
@@ -962,6 +984,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                             GapMode::Affine => unsafe {
@@ -972,6 +995,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                             GapMode::Convex => unsafe {
@@ -982,6 +1006,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                         }
@@ -1011,6 +1036,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                             GapMode::Affine => unsafe {
@@ -1021,6 +1047,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                             GapMode::Convex => unsafe {
@@ -1031,6 +1058,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                         }
@@ -1064,6 +1092,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                             GapMode::Affine => unsafe {
@@ -1074,6 +1103,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                             GapMode::Convex => unsafe {
@@ -1084,6 +1114,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                         }
@@ -1114,6 +1145,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                             GapMode::Affine => unsafe {
@@ -1124,6 +1156,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                             GapMode::Convex => unsafe {
@@ -1134,6 +1167,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                         }
@@ -1163,6 +1197,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                             GapMode::Affine => unsafe {
@@ -1173,6 +1208,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                             GapMode::Convex => unsafe {
@@ -1183,6 +1219,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    None,
                                 )
                             },
                         }
