@@ -16,6 +16,29 @@
 use super::{Alignment, AlignmentType, Scoring};
 use crate::graph::{EdgeId, Graph};
 
+/// Read-only access to a DP matrix cell `(i, j)` (graph row, sequence column) as `i32`, abstracting
+/// over the layout the values live in. The scalar engine (and any destriped SIMD path) reads them
+/// row-major via [`RowMajor`]; the SIMD path can instead index its striped fill output directly
+/// (see the striped view in [`super::simd`]), letting it skip the full-matrix destripe and touch
+/// only the cells the backtrack actually walks.
+pub(crate) trait CellRead {
+    /// The DP value at graph row `i`, sequence column `j`.
+    fn get(&self, i: usize, j: usize) -> i32;
+}
+
+/// Row-major view of a contiguous `i32` DP buffer: cell `(i, j)` is `buf[i * width + j]`.
+pub(crate) struct RowMajor<'a> {
+    pub buf: &'a [i32],
+    pub width: usize,
+}
+
+impl CellRead for RowMajor<'_> {
+    #[inline(always)]
+    fn get(&self, i: usize, j: usize) -> i32 {
+        self.buf[i * self.width + j]
+    }
+}
+
 /// Backtrack step 1 (match/mismatch) — the highest-precedence predecessor test, shared verbatim
 /// by [`backtrack_linear`], [`backtrack_affine`], and [`backtrack_convex`]
 /// (`sisd_alignment_engine.cpp:395-420,577-601,805-829` — byte-identical in all three).
@@ -27,11 +50,11 @@ use crate::graph::{EdgeId, Graph};
 /// **The in-edge iteration order and first-equality-wins semantics are the tie-break that keeps
 /// consensus/MSA parity with spoa — they must not be reordered.**
 #[inline]
-fn backtrack_match_step(
+fn backtrack_match_step<V: CellRead>(
     graph: &Graph,
     node_id_to_rank: &[u32],
     sequence_profile: &[i32],
-    h: &[i32],
+    h: &V,
     matrix_width: usize,
     i: usize,
     j: usize,
@@ -39,7 +62,7 @@ fn backtrack_match_step(
     if i == 0 || j == 0 {
         return None;
     }
-    let h_ij = h[i * matrix_width + j];
+    let h_ij = h.get(i, j);
     let node = &graph.nodes[graph.rank_to_node[i - 1].0 as usize];
     let match_cost = sequence_profile[node.code as usize * matrix_width + j];
     let pred_row = |edge_id: EdgeId| -> usize {
@@ -51,12 +74,12 @@ fn backtrack_match_step(
     } else {
         pred_row(node.inedges[0])
     };
-    if h_ij == h[pred_first * matrix_width + (j - 1)] + match_cost {
+    if h_ij == h.get(pred_first, j - 1) + match_cost {
         return Some((pred_first, j - 1));
     }
     for p in 1..node.inedges.len() {
         let pred_i = pred_row(node.inedges[p]);
-        if h_ij == h[pred_i * matrix_width + (j - 1)] + match_cost {
+        if h_ij == h.get(pred_i, j - 1) + match_cost {
             return Some((pred_i, j - 1));
         }
     }
@@ -87,11 +110,44 @@ pub(crate) fn backtrack_linear(
     max_j: usize,
     max_score: i32,
 ) -> Alignment {
+    backtrack_linear_impl(
+        graph,
+        node_id_to_rank,
+        sequence_profile,
+        &RowMajor {
+            buf: h,
+            width: matrix_width,
+        },
+        matrix_width,
+        alignment_type,
+        scoring,
+        max_i,
+        max_j,
+        max_score,
+    )
+}
+
+/// The linear backtrack proper, generic over a [`CellRead`] view of `H`. [`backtrack_linear`]
+/// feeds it a [`RowMajor`] view; the SIMD path feeds a striped view to skip the destripe (see
+/// [`backtrack_convex_impl`] for the rationale).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn backtrack_linear_impl<V: CellRead>(
+    graph: &Graph,
+    node_id_to_rank: &[u32],
+    sequence_profile: &[i32],
+    h: &V,
+    matrix_width: usize,
+    alignment_type: AlignmentType,
+    scoring: &Scoring,
+    max_i: usize,
+    max_j: usize,
+    max_score: i32,
+) -> Alignment {
     if max_i == 0 && max_j == 0 {
         return Vec::new();
     }
     debug_assert_eq!(
-        h[max_i * matrix_width + max_j],
+        h.get(max_i, max_j),
         max_score,
         "fill's max_score must match H at (max_i, max_j)"
     );
@@ -109,7 +165,7 @@ pub(crate) fn backtrack_linear(
 
     loop {
         let keep_going = match alignment_type {
-            AlignmentType::Local => h[i * matrix_width + j] != 0,
+            AlignmentType::Local => h.get(i, j) != 0,
             AlignmentType::Global => !(i == 0 && j == 0),
             AlignmentType::Overlap => !(i == 0 || j == 0),
         };
@@ -117,7 +173,7 @@ pub(crate) fn backtrack_linear(
             break;
         }
 
-        let h_ij = h[i * matrix_width + j];
+        let h_ij = h.get(i, j);
         let mut prev_i = 0usize;
         let mut prev_j = 0usize;
         let mut predecessor_found = false;
@@ -145,14 +201,14 @@ pub(crate) fn backtrack_linear(
             } else {
                 pred_row(node.inedges[0])
             };
-            if h_ij == h[pred_first * matrix_width + j] + g {
+            if h_ij == h.get(pred_first, j) + g {
                 prev_i = pred_first;
                 prev_j = j;
                 predecessor_found = true;
             } else {
                 for p in 1..node.inedges.len() {
                     let pred_i = pred_row(node.inedges[p]);
-                    if h_ij == h[pred_i * matrix_width + j] + g {
+                    if h_ij == h.get(pred_i, j) + g {
                         prev_i = pred_i;
                         prev_j = j;
                         predecessor_found = true;
@@ -166,7 +222,7 @@ pub(crate) fn backtrack_linear(
         // `j != 0` guard mirrors the affine/convex backtracks: at the left edge column 0 is
         // always reconstructed by the deletion step above, so this branch is unreachable
         // there for well-formed matrices, but the guard keeps `j - 1` from underflowing.
-        if !predecessor_found && j != 0 && h_ij == h[i * matrix_width + (j - 1)] + g {
+        if !predecessor_found && j != 0 && h_ij == h.get(i, j - 1) + g {
             prev_i = i;
             prev_j = j - 1;
         }
@@ -210,11 +266,54 @@ pub(crate) fn backtrack_affine(
     max_j: usize,
     max_score: i32,
 ) -> Alignment {
+    backtrack_affine_impl(
+        graph,
+        node_id_to_rank,
+        sequence_profile,
+        &RowMajor {
+            buf: h,
+            width: matrix_width,
+        },
+        &RowMajor {
+            buf: e,
+            width: matrix_width,
+        },
+        &RowMajor {
+            buf: f,
+            width: matrix_width,
+        },
+        matrix_width,
+        alignment_type,
+        scoring,
+        max_i,
+        max_j,
+        max_score,
+    )
+}
+
+/// The affine backtrack proper, generic over a [`CellRead`] view of `H`/`E`/`F`. [`backtrack_affine`]
+/// feeds it [`RowMajor`] views; the SIMD path feeds striped views to skip the destripe (see
+/// [`backtrack_convex_impl`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn backtrack_affine_impl<V: CellRead>(
+    graph: &Graph,
+    node_id_to_rank: &[u32],
+    sequence_profile: &[i32],
+    h: &V,
+    e: &V,
+    f: &V,
+    matrix_width: usize,
+    alignment_type: AlignmentType,
+    scoring: &Scoring,
+    max_i: usize,
+    max_j: usize,
+    max_score: i32,
+) -> Alignment {
     if max_i == 0 && max_j == 0 {
         return Vec::new();
     }
     debug_assert_eq!(
-        h[max_i * matrix_width + max_j],
+        h.get(max_i, max_j),
         max_score,
         "fill's max_score must match H at (max_i, max_j)"
     );
@@ -233,7 +332,7 @@ pub(crate) fn backtrack_affine(
 
     loop {
         let keep_going = match alignment_type {
-            AlignmentType::Local => h[i * matrix_width + j] != 0,
+            AlignmentType::Local => h.get(i, j) != 0,
             AlignmentType::Global => !(i == 0 && j == 0),
             AlignmentType::Overlap => !(i == 0 || j == 0),
         };
@@ -241,7 +340,7 @@ pub(crate) fn backtrack_affine(
             break;
         }
 
-        let h_ij = h[i * matrix_width + j];
+        let h_ij = h.get(i, j);
         let mut prev_i = 0usize;
         let mut prev_j = 0usize;
         let mut predecessor_found = false;
@@ -273,18 +372,18 @@ pub(crate) fn backtrack_affine(
             } else {
                 pred_row(node.inedges[0])
             };
-            let a = h_ij == f[pred_first * matrix_width + j] + e_penalty;
+            let a = h_ij == f.get(pred_first, j) + e_penalty;
             extend_up = a;
-            if a || h_ij == h[pred_first * matrix_width + j] + g {
+            if a || h_ij == h.get(pred_first, j) + g {
                 prev_i = pred_first;
                 prev_j = j;
                 predecessor_found = true;
             } else {
                 for p in 1..node.inedges.len() {
                     let pred_i = pred_row(node.inedges[p]);
-                    let a = h_ij == f[pred_i * matrix_width + j] + e_penalty;
+                    let a = h_ij == f.get(pred_i, j) + e_penalty;
                     extend_up = a;
-                    if a || h_ij == h[pred_i * matrix_width + j] + g {
+                    if a || h_ij == h.get(pred_i, j) + g {
                         prev_i = pred_i;
                         prev_j = j;
                         predecessor_found = true;
@@ -297,9 +396,9 @@ pub(crate) fn backtrack_affine(
         // 3. Insertion / gap along the sequence axis (:629-636) — lowest precedence. Same
         // `(extend_left = A) || B` short-circuit idiom.
         if !predecessor_found && j != 0 {
-            let a = h_ij == e[i * matrix_width + (j - 1)] + e_penalty;
+            let a = h_ij == e.get(i, j - 1) + e_penalty;
             extend_left = a;
-            if a || h_ij == h[i * matrix_width + (j - 1)] + g {
+            if a || h_ij == h.get(i, j - 1) + g {
                 prev_i = i;
                 prev_j = j - 1;
             }
@@ -322,7 +421,7 @@ pub(crate) fn backtrack_affine(
             loop {
                 alignment.push((-1, (j - 1) as i32));
                 j -= 1;
-                if e[i * matrix_width + j] + e_penalty != e[i * matrix_width + (j + 1)] {
+                if e.get(i, j) + e_penalty != e.get(i, j + 1) {
                     break;
                 }
             }
@@ -334,9 +433,9 @@ pub(crate) fn backtrack_affine(
                 prev_i = 0;
                 for &edge_id in &graph.nodes[graph.rank_to_node[i - 1].0 as usize].inedges {
                     let pred_i = pred_row(edge_id);
-                    let s = f[i * matrix_width + j] == h[pred_i * matrix_width + j] + g;
+                    let s = f.get(i, j) == h.get(pred_i, j) + g;
                     stop = s;
-                    if s || f[i * matrix_width + j] == f[pred_i * matrix_width + j] + e_penalty {
+                    if s || f.get(i, j) == f.get(pred_i, j) + e_penalty {
                         prev_i = pred_i;
                         break;
                     }
@@ -384,11 +483,67 @@ pub(crate) fn backtrack_convex(
     max_j: usize,
     max_score: i32,
 ) -> Alignment {
+    backtrack_convex_impl(
+        graph,
+        node_id_to_rank,
+        sequence_profile,
+        &RowMajor {
+            buf: h,
+            width: matrix_width,
+        },
+        &RowMajor {
+            buf: e,
+            width: matrix_width,
+        },
+        &RowMajor {
+            buf: f,
+            width: matrix_width,
+        },
+        &RowMajor {
+            buf: o,
+            width: matrix_width,
+        },
+        &RowMajor {
+            buf: q,
+            width: matrix_width,
+        },
+        matrix_width,
+        alignment_type,
+        scoring,
+        max_i,
+        max_j,
+        max_score,
+    )
+}
+
+/// The convex backtrack proper, generic over a [`CellRead`] view of the H/E/F/O/Q matrices.
+///
+/// [`backtrack_convex`] feeds it [`RowMajor`] views (the scalar/destriped path); the SIMD engine
+/// feeds striped views so it can skip the full-matrix destripe and index the striped fill output
+/// directly along the (short) backtrack path. `matrix_width` is retained only for the row-major
+/// `sequence_profile` read inside [`backtrack_match_step`]; all H/E/F/O/Q reads go through `.get`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn backtrack_convex_impl<V: CellRead>(
+    graph: &Graph,
+    node_id_to_rank: &[u32],
+    sequence_profile: &[i32],
+    h: &V,
+    e: &V,
+    f: &V,
+    o: &V,
+    q: &V,
+    matrix_width: usize,
+    alignment_type: AlignmentType,
+    scoring: &Scoring,
+    max_i: usize,
+    max_j: usize,
+    max_score: i32,
+) -> Alignment {
     if max_i == 0 && max_j == 0 {
         return Vec::new();
     }
     debug_assert_eq!(
-        h[max_i * matrix_width + max_j],
+        h.get(max_i, max_j),
         max_score,
         "fill's max_score must match H at (max_i, max_j)"
     );
@@ -409,7 +564,7 @@ pub(crate) fn backtrack_convex(
 
     loop {
         let keep_going = match alignment_type {
-            AlignmentType::Local => h[i * matrix_width + j] != 0,
+            AlignmentType::Local => h.get(i, j) != 0,
             AlignmentType::Global => !(i == 0 && j == 0),
             AlignmentType::Overlap => !(i == 0 || j == 0),
         };
@@ -417,7 +572,7 @@ pub(crate) fn backtrack_convex(
             break;
         }
 
-        let h_ij = h[i * matrix_width + j];
+        let h_ij = h.get(i, j);
         let mut prev_i = 0usize;
         let mut prev_j = 0usize;
         let mut predecessor_found = false;
@@ -452,16 +607,16 @@ pub(crate) fn backtrack_convex(
             } else {
                 pred_row(node.inedges[0])
             };
-            let a = h_ij == f[pred_first * matrix_width + j] + e_penalty;
+            let a = h_ij == f.get(pred_first, j) + e_penalty;
             extend_up |= a;
             let cond = a
-                || h_ij == h[pred_first * matrix_width + j] + g
+                || h_ij == h.get(pred_first, j) + g
                 || {
-                    let b = h_ij == o[pred_first * matrix_width + j] + c_penalty;
+                    let b = h_ij == o.get(pred_first, j) + c_penalty;
                     extend_up |= b;
                     b
                 }
-                || h_ij == h[pred_first * matrix_width + j] + q_penalty;
+                || h_ij == h.get(pred_first, j) + q_penalty;
             if cond {
                 prev_i = pred_first;
                 prev_j = j;
@@ -469,16 +624,16 @@ pub(crate) fn backtrack_convex(
             } else {
                 for p in 1..node.inedges.len() {
                     let pred_i = pred_row(node.inedges[p]);
-                    let a = h_ij == f[pred_i * matrix_width + j] + e_penalty;
+                    let a = h_ij == f.get(pred_i, j) + e_penalty;
                     extend_up |= a;
                     let cond = a
-                        || h_ij == h[pred_i * matrix_width + j] + g
+                        || h_ij == h.get(pred_i, j) + g
                         || {
-                            let b = h_ij == o[pred_i * matrix_width + j] + c_penalty;
+                            let b = h_ij == o.get(pred_i, j) + c_penalty;
                             extend_up |= b;
                             b
                         }
-                        || h_ij == h[pred_i * matrix_width + j] + q_penalty;
+                        || h_ij == h.get(pred_i, j) + q_penalty;
                     if cond {
                         prev_i = pred_i;
                         prev_j = j;
@@ -493,16 +648,16 @@ pub(crate) fn backtrack_convex(
         // four-term `(extend_left |= E-extend) || H-open || (extend_left |= Q-extend) ||
         // H-2nd-open` short-circuit idiom.
         if !predecessor_found && j != 0 {
-            let a = h_ij == e[i * matrix_width + (j - 1)] + e_penalty;
+            let a = h_ij == e.get(i, j - 1) + e_penalty;
             extend_left |= a;
             let cond = a
-                || h_ij == h[i * matrix_width + (j - 1)] + g
+                || h_ij == h.get(i, j - 1) + g
                 || {
-                    let b = h_ij == q[i * matrix_width + (j - 1)] + c_penalty;
+                    let b = h_ij == q.get(i, j - 1) + c_penalty;
                     extend_left |= b;
                     b
                 }
-                || h_ij == h[i * matrix_width + (j - 1)] + q_penalty;
+                || h_ij == h.get(i, j - 1) + q_penalty;
             if cond {
                 prev_i = i;
                 prev_j = j - 1;
@@ -527,8 +682,8 @@ pub(crate) fn backtrack_convex(
             loop {
                 alignment.push((-1, (j - 1) as i32));
                 j -= 1;
-                let e_stops = e[i * matrix_width + j] + e_penalty != e[i * matrix_width + (j + 1)];
-                let q_stops = q[i * matrix_width + j] + c_penalty != q[i * matrix_width + (j + 1)];
+                let e_stops = e.get(i, j) + e_penalty != e.get(i, j + 1);
+                let q_stops = q.get(i, j) + c_penalty != q.get(i, j + 1);
                 if e_stops && q_stops {
                     break;
                 }
@@ -543,8 +698,8 @@ pub(crate) fn backtrack_convex(
                 // Phase A: try to continue an F or O extend.
                 for &edge_id in &graph.nodes[graph.rank_to_node[i - 1].0 as usize].inedges {
                     let pred_i = pred_row(edge_id);
-                    if f[i * matrix_width + j] == f[pred_i * matrix_width + j] + e_penalty
-                        || o[i * matrix_width + j] == o[pred_i * matrix_width + j] + c_penalty
+                    if f.get(i, j) == f.get(pred_i, j) + e_penalty
+                        || o.get(i, j) == o.get(pred_i, j) + c_penalty
                     {
                         prev_i = pred_i;
                         stop = false;
@@ -555,8 +710,8 @@ pub(crate) fn backtrack_convex(
                 if stop {
                     for &edge_id in &graph.nodes[graph.rank_to_node[i - 1].0 as usize].inedges {
                         let pred_i = pred_row(edge_id);
-                        if f[i * matrix_width + j] == h[pred_i * matrix_width + j] + g
-                            || o[i * matrix_width + j] == h[pred_i * matrix_width + j] + q_penalty
+                        if f.get(i, j) == h.get(pred_i, j) + g
+                            || o.get(i, j) == h.get(pred_i, j) + q_penalty
                         {
                             prev_i = pred_i;
                             break;
