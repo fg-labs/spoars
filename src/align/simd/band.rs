@@ -101,6 +101,72 @@ pub(crate) fn anchor(r_len: u32, query_len: usize) -> usize {
     query_len.saturating_sub(r_len as usize)
 }
 
+/// Half-open query-column window for a node: union of its anchor with its predecessors' best
+/// columns `[Mstart, Mend]`, widened by `w` on each side and clamped to `[0, L]`. A source node
+/// passes `mstart = mend = anchor`.
+// See `remaining_path`'s identical `#[allow(dead_code)]` rationale above: not yet wired into the
+// SIMD fill's per-row band derivation (a later banded-POA task).
+#[allow(dead_code)]
+pub(crate) fn node_window(
+    anchor: usize,
+    mstart: usize,
+    mend: usize,
+    w: usize,
+    query_len: usize,
+) -> (usize, usize) {
+    let lo = mstart.min(anchor);
+    let hi = mend.max(anchor);
+    let beg = lo.saturating_sub(w);
+    let end = (hi + w + 1).min(query_len);
+    (beg, end)
+}
+
+/// Segment (vector-lane) range `[beg_sn, end_sn)` covering `[beg, end)` query columns, clamped to
+/// the row block and guaranteed **non-empty** (MINOR 6). `beg_sn` floors, `end_sn` ceils — so the
+/// effective computed band is `[beg_sn*lanes, end_sn*lanes)`; the left-edge carry closure therefore
+/// happens at `beg_sn*lanes`, which unit tests must target (not the unquantized `beg`).
+#[allow(dead_code)]
+pub(crate) fn segment_range(
+    beg: usize,
+    end: usize,
+    lanes: usize,
+    matrix_width_vecs: usize,
+) -> (usize, usize) {
+    let beg_sn = (beg / lanes).min(matrix_width_vecs.saturating_sub(1));
+    let mut end_sn = end.div_ceil(lanes).min(matrix_width_vecs);
+    if end_sn <= beg_sn {
+        end_sn = (beg_sn + 1).min(matrix_width_vecs);
+    }
+    (beg_sn, end_sn)
+}
+
+/// Per-align band scratch: precomputed `R` (by rank), the half-width `w`, and a `best_col` buffer
+/// filled incrementally as the fill reaches each row. `best_col[rank]` is set to the query column of
+/// that row's max via the `LANES`-independent `index_of` flat-scan (MINOR 5 determinism), by the fill.
+#[allow(dead_code)]
+pub(crate) struct BandState {
+    pub(crate) r: Vec<u32>,
+    pub(crate) best_col: Vec<u32>,
+    pub(crate) w: usize,
+}
+
+impl BandState {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        graph: &crate::graph::Graph,
+        node_id_to_rank: &[u32],
+        query_len: usize,
+        cfg: BandConfig,
+    ) -> BandState {
+        let r = remaining_path(graph, node_id_to_rank);
+        BandState {
+            best_col: vec![0; r.len()],
+            r,
+            w: cfg.width(query_len),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +304,71 @@ mod tests {
         assert_eq!(r[z_rank], 1);
         assert_eq!(r[x_rank], 2);
         assert_eq!(r[a_rank], 3);
+    }
+
+    // ---- node_window / segment_range / BandState ---------------------------------------------
+
+    #[test]
+    fn node_window_is_union_of_anchor_and_predecessors_widened() {
+        // beg = max(0, min(Mstart, anchor) - w); end = min(L, max(Mend, anchor) + w + 1)
+        let (beg, end) = node_window(
+            /*anchor*/ 100, /*mstart*/ 90, /*mend*/ 110, /*w*/ 12,
+            /*L*/ 235,
+        );
+        assert_eq!(beg, 90 - 12);
+        assert_eq!(end, 110 + 12 + 1);
+        // clamps at 0 and L
+        let (b0, e0) = node_window(5, 5, 5, 12, 235);
+        assert_eq!(b0, 0);
+        let _ = e0;
+        let (_, e_l) = node_window(230, 230, 230, 12, 235);
+        assert_eq!(e_l, 235);
+    }
+
+    #[test]
+    fn segment_range_half_open_no_off_by_one() {
+        // L % LANES == 0 boundary (MAJOR 6): end==L must give end_sn==matrix_width_vecs, not +1.
+        let lanes = 8;
+        let mwv = 240usize.div_ceil(lanes); // 30
+        let (bs, es) = segment_range(0, 240, lanes, mwv);
+        assert_eq!((bs, es), (0, 30));
+        // L % LANES == 1 boundary
+        let mwv2 = 241usize.div_ceil(lanes); // 31
+        let (_, es2) = segment_range(0, 241, lanes, mwv2);
+        assert_eq!(es2, 31);
+        // interior band -> floored beg, ceil end
+        let (bs3, es3) = segment_range(20, 60, 8, 30);
+        assert_eq!((bs3, es3), (2, 8)); // 20/8=2 ; ceil(60/8)=8
+    }
+
+    #[test]
+    fn segment_range_never_empty() {
+        // MINOR 6: an empty [beg,beg) window must widen to a single non-empty segment.
+        let (bs, es) = segment_range(240, 240, 8, 30);
+        assert!(es > bs);
+        assert!(es <= 30);
+    }
+
+    #[test]
+    fn segment_range_widens_when_end_sn_le_beg_sn() {
+        // beg==end==L at the last segment: raw beg_sn=29 (clamped), raw end_sn=29 -> guard widens
+        // end_sn to 30 so the range is non-empty (drops-whole-row-to-NEG_INF regression guard).
+        assert_eq!(segment_range(232, 232, 8, 30), (29, 30));
+    }
+
+    #[test]
+    fn band_state_new_builds_r_and_best_col_from_graph() {
+        let (graph, node_id_to_rank) = linear_chain_3();
+        let cfg = BandConfig {
+            base: 10,
+            frac: 0.01,
+        };
+        let state = BandState::new(&graph, &node_id_to_rank, 235, cfg);
+        assert_eq!(state.r.len(), graph.num_nodes());
+        assert_eq!(state.best_col.len(), state.r.len());
+        assert!(state.best_col.iter().all(|&c| c == 0));
+        assert_eq!(state.w, cfg.width(235));
+        // r matches remaining_path directly.
+        assert_eq!(state.r, remaining_path(&graph, &node_id_to_rank));
     }
 }
