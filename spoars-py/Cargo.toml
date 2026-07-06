@@ -1,0 +1,23 @@
+# Standalone crate (its own `[workspace]`) so the parent spoars package's
+# `cargo` commands never pull it in; it is built only via maturin and linted
+# separately in the Python CI workflow.
+[workspace]
+
+[package]
+name = "spoars-py"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Nils Homer <nils@fulcrumgenomics.com>"]
+repository = "https://github.com/fg-labs/spoars"
+publish = false
+
+[lib]
+name = "_spoars"
+crate-type = ["cdylib"]
+
+[dependencies]
+# `default-features = false` drops the `cli` feature (and thus needletail + its
+# compression C deps): the bindings only use the pure-Rust POA engine.
+spoars = { path = "..", default-features = false }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }

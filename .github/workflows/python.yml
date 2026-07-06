@@ -1,0 +1,58 @@
+name: Python
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    working-directory: spoars-py
+
+jobs:
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [py310, py313, py314]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: spoars-py
+      # spoars-py is its own workspace, so the check.yml fmt/lint jobs (which run
+      # over the root spoars crate) never see it. Gate its Rust source here with
+      # the raw commands (the parent .cargo aliases don't apply in this crate).
+      - name: Check Rust formatting
+        run: cargo fmt -- --check
+      - name: Clippy (Rust)
+        run: cargo clippy --all-targets -- -D warnings
+      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
+        with:
+          pixi-version: v0.71.0
+          manifest-path: spoars-py/pixi.toml
+          cache: true
+      - name: Check formatting
+        run: pixi run format-check
+      - name: Lint
+        run: pixi run lint
+      - name: Type check
+        run: pixi run typecheck
+      # Build and test the abi3 extension against each supported interpreter
+      # (matrix above) so a pyo3/Python incompatibility can't slip through — the
+      # wheels are abi3, but the build still runs against the active interpreter.
+      - name: Build & test
+        run: pixi run -e ${{ matrix.env }} test

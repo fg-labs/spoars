@@ -1,0 +1,102 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "spoars"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "Python bindings for spoars — partial order alignment consensus and MSA"
+license = { text = "MIT" }
+authors = [{ name = "Nils Homer", email = "nils@fulcrumgenomics.com" }]
+readme = "README.md"
+keywords = ["bioinformatics", "poa", "alignment", "consensus", "msa", "genomics"]
+classifiers = [
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Intended Audience :: Science/Research",
+]
+
+[project.urls]
+Homepage = "https://github.com/fg-labs/spoars"
+Repository = "https://github.com/fg-labs/spoars"
+
+[tool.maturin]
+module-name = "spoars._spoars"
+python-source = "python"
+features = ["pyo3/extension-module"]
+strip = true
+
+[tool.ruff]
+line-length    = 100
+target-version = "py310"
+output-format  = "full"
+preview        = true
+
+[tool.ruff.lint]
+select = [
+    "A",      # Builtin shadowing
+    "ARG",    # Unused arguments
+    "C901",   # McCabe complexity
+    "B",      # bugbear
+    "D",      # pydocstyle (google convention)
+    "D204",   # Blank line between class docstring and first method
+    "D213",   # Summary line on the line after opening quotes
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # PEP8 naming
+    "W",      # pycodestyle warnings
+    "Q",      # flake8-quotes
+    "RUF012", # Mutable class attributes should be annotated with typing.ClassVar
+]
+ignore = [
+    "E203",
+    "E701",
+    "D212",  # summary line on the same line as opening quotes
+    "D100",  # missing docstring in public module
+    "D104",  # missing docstring in public package
+]
+unfixable = ["B"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**.py" = ["D103", "D102", "D101", "D100", "D104"]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+files                       = ["python", "tests"]
+strict_optional             = true
+strict_equality             = true
+check_untyped_defs          = true
+disallow_any_generics       = true
+disallow_untyped_calls      = true
+disallow_untyped_decorators = true
+disallow_untyped_defs       = true
+no_implicit_optional        = true
+warn_no_return              = true
+warn_redundant_casts        = true
+warn_return_any             = true
+warn_unreachable            = true
+warn_unused_configs         = true
+python_version              = "3.10"
+enable_error_code           = [
+    "ignore-without-code",
+    "possibly-undefined",
+]
+
+[[tool.mypy.overrides]]
+module = ["spoars._spoars"]
+ignore_missing_imports = true

@@ -1,0 +1,72 @@
+"""Type stubs for the spoars `_spoars` extension module."""
+
+from __future__ import annotations
+
+__version__: str
+
+class Scoring:
+    """Validated match/mismatch/gap scoring (spoa sign convention)."""
+
+    def __init__(
+        self,
+        match: int,
+        mismatch: int,
+        gap_open: int,
+        gap_extend: int,
+        gap_open2: int,
+        gap_extend2: int,
+    ) -> None:
+        """Create scoring; raises ``ValueError`` if a gap penalty is positive."""
+
+    @staticmethod
+    def default() -> Scoring:
+        """The spoa/CLI default convex scoring (5, -4, -8, -6, -10, -4)."""
+
+    def gap_mode(self) -> str:
+        """The inferred gap model: ``"linear"``, ``"affine"``, or ``"convex"``."""
+
+    def __repr__(self) -> str: ...
+
+class Poa:
+    """A partial order alignment graph builder."""
+
+    def __init__(
+        self,
+        alignment_type: str = "global",
+        scoring: Scoring | None = None,
+    ) -> None:
+        """Create a builder. ``alignment_type`` is ``"global"``/``"local"``/``"overlap"``."""
+
+    def add(self, sequence: str, weight: int = 1) -> int:
+        """Align and merge ``sequence``; return its 0-based sequence index."""
+
+    def consensus(self, min_coverage: int | None = None) -> str:
+        """The consensus sequence (optionally pruning low-coverage nodes)."""
+
+    def msa(self, include_consensus: bool = False) -> list[str]:
+        """The multiple sequence alignment, one row per added sequence."""
+
+    def gfa(
+        self,
+        headers: list[str] | None = None,
+        is_reversed: list[bool] | None = None,
+        include_consensus: bool = False,
+    ) -> str:
+        """The graph in GFA v1 format."""
+
+    def dot(self) -> str:
+        """The graph in Graphviz DOT format."""
+
+    def num_nodes(self) -> int: ...
+    def num_edges(self) -> int: ...
+    def num_sequences(self) -> int: ...
+    def __len__(self) -> int: ...
+    def __repr__(self) -> str: ...
+
+def poa(
+    sequences: list[str],
+    alignment_type: str = "global",
+    scoring: Scoring | None = None,
+    weights: list[int] | None = None,
+) -> Poa:
+    """Build a POA graph from ``sequences`` in one call and return the ``Poa``."""

@@ -1,0 +1,38 @@
+[workspace]
+name = "spoars-py"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+
+[dependencies]
+python = ">=3.10,<3.15"
+pip = "*"
+maturin = ">=1.5,<2.0"
+pytest = "*"
+ruff = "*"
+mypy = "*"
+
+[tasks]
+develop      = { cmd = "maturin develop --release", description = "Build & install the extension into this env" }
+build        = { cmd = "maturin build --release",   description = "Build a wheel into target/wheels" }
+test         = { cmd = "python -m pytest -q",        depends-on = ["develop"], description = "Run pytest after rebuilding" }
+format       = { cmd = "ruff format",               description = "Format Python source with ruff" }
+format-check = { cmd = "ruff format --check",        description = "Check formatting without modifying files" }
+lint         = { cmd = "ruff check",                description = "Lint Python source with ruff" }
+typecheck    = { cmd = "mypy python tests",          description = "Type-check with mypy" }
+
+# Pinned-interpreter environments so `pixi run -e pyXYZ test` builds and tests
+# the extension against a specific Python. CI runs several to guarantee each
+# supported interpreter builds the abi3 extension (see python.yml).
+[feature.py310.dependencies]
+python = "3.10.*"
+
+[feature.py313.dependencies]
+python = "3.13.*"
+
+[feature.py314.dependencies]
+python = "3.14.*"
+
+[environments]
+py310 = ["py310"]
+py313 = ["py313"]
+py314 = ["py314"]
