@@ -402,9 +402,20 @@ where
         // Record this row's max query column into `best_col[rank]` (banded only). Uses the
         // `LANES`-independent `index_of` flat-scan over the IN-BAND slice (determinism across ISAs,
         // §best_col propagation), offset by `beg_col`; the next row's Mstart/Mend read it.
+        //
+        // For Overlap, `row_best` must use the UNCLAMPED [`row_max`] rather than the 0-floored
+        // [`Simd::horizontal_max`]: `hv` is never floored for Overlap (only `AlignmentType::Local`
+        // clamps a few lines above), so a genuinely negative Overlap row max would make the floored
+        // `horizontal_max` return `0` — a value matching no in-band cell — sending `index_of` to
+        // `-1` and mis-centering the next row's window by at least one column. Local/Global keep the
+        // floored reduction (it matches `hv`'s own clamping there, so it always finds a real cell).
         if let Some(state) = band.as_deref_mut() {
             let rank = node_id_to_rank[node_id.0 as usize] as usize;
-            let row_best = S::horizontal_max(score).to_i32();
+            let row_best = if alignment_type == AlignmentType::Overlap {
+                row_max::<S>(score)
+            } else {
+                S::horizontal_max(score).to_i32()
+            };
             let col = index_of::<S>(
                 &striped_h[row_base + beg_sn..row_base + end_sn],
                 end_sn - beg_sn,
@@ -726,9 +737,17 @@ where
         // Record this row's max query column into `best_col[rank]` (banded only), via the
         // `LANES`-independent `index_of` flat-scan over the IN-BAND slice offset by `beg_col`, exactly
         // as `fill_linear` does; the next row's Mstart/Mend read it.
+        //
+        // Overlap uses the UNCLAMPED [`row_max`] here, not the 0-floored [`Simd::horizontal_max`] —
+        // see the identical fix (and its rationale) in [`fill_linear`]'s best_col recording. Local/
+        // Global are unaffected: they keep the floored reduction.
         if let Some(state) = band.as_deref_mut() {
             let rank = node_id_to_rank[node_id.0 as usize] as usize;
-            let row_best = S::horizontal_max(score).to_i32();
+            let row_best = if alignment_type == AlignmentType::Overlap {
+                row_max::<S>(score)
+            } else {
+                S::horizontal_max(score).to_i32()
+            };
             let col = index_of::<S>(
                 &striped_h[row_base + beg_sn..row_base + end_sn],
                 end_sn - beg_sn,
@@ -1095,9 +1114,17 @@ where
         // Record this row's max query column into `best_col[rank]` (banded only), via the
         // `LANES`-independent `index_of` flat-scan over the IN-BAND slice offset by `beg_col`, exactly
         // as `fill_affine` does; the next row's Mstart/Mend read it.
+        //
+        // Overlap uses the UNCLAMPED [`row_max`] here, not the 0-floored [`Simd::horizontal_max`] —
+        // see the identical fix (and its rationale) in [`fill_linear`]'s best_col recording. Local/
+        // Global are unaffected: they keep the floored reduction.
         if let Some(state) = band.as_deref_mut() {
             let rank = node_id_to_rank[node_id.0 as usize] as usize;
-            let row_best = S::horizontal_max(score).to_i32();
+            let row_best = if alignment_type == AlignmentType::Overlap {
+                row_max::<S>(score)
+            } else {
+                S::horizontal_max(score).to_i32()
+            };
             let col = index_of::<S>(
                 &striped_h[row_base + beg_sn..row_base + end_sn],
                 end_sn - beg_sn,

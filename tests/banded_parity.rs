@@ -258,13 +258,21 @@ proptest! {
     }
 
     /// **Saturation-safety invariant.** For an arbitrary family (substitutions *and* indels, some
-    /// deliberately wider than the band) under Global convex, the banded score aligned against the
-    /// exact-built graph must never *exceed* the exact score for the same `(read, graph)`.
+    /// deliberately wider than the band), the banded score aligned against the exact-built graph
+    /// must never *exceed* the exact score for the same `(read, graph)` — checked across ALL 9
+    /// combinations of {Global, Local, Overlap} x {linear, affine, convex}, not just Global/convex.
     ///
     /// Banding only ever removes cells from the DP, so a banded optimum is a subset optimum:
-    /// `banded_score <= exact_score` must hold with no exceptions. A banded score *above* exact is
-    /// the cheapest strong signal that a `NEG_INF` sentinel leaked into a live cell and wrapped
-    /// positive — the Task 2/9 saturation guarantee observed end-to-end.
+    /// `banded_score <= exact_score` must hold with no exceptions, for every type x mode combination.
+    /// A banded score *above* exact is the cheapest strong signal that a `NEG_INF` sentinel leaked
+    /// into a live cell and wrapped positive — the Task 2/9 saturation guarantee observed end-to-end.
+    /// Because the sentinel-leak risk is per-fill (`fill_linear`/`fill_affine`/`fill_convex`) and
+    /// per-type (Global/Local/Overlap each have their own endpoint-scanning branch, see `fill.rs`),
+    /// covering only one combination would leave the other 8 fill x type branches unpinned.
+    ///
+    /// One exact + one banded engine is built per (type, mode) pair, each folding the SAME
+    /// per-pair-independent graph (grown from the EXACT alignment, so both engines always face an
+    /// identical graph for that pair) — mirroring the single-pair version's structure, just looped.
     ///
     /// Indels here run up to 30bp specifically because that width reliably overflows
     /// `BandConfig::default()`'s adaptive band (empirically ~10% of reads land strictly below exact
@@ -273,37 +281,56 @@ proptest! {
     /// property alone can't *prove* it ever exercises the `<` side — a case count that happens to
     /// avoid every miss would still pass vacuously. [`banded_strictly_below_exact_occurs_for_wide_indels`]
     /// is the non-vacuity backstop: a plain deterministic test using the same generator that asserts
-    /// at least one strict miss actually occurs.
+    /// at least one strict miss actually occurs (for Global/convex, the original pair).
     #[test]
     fn banded_never_beats_exact(seed in any::<u64>()) {
-        let mut rng = Rng::new(seed);
-        let base_len = random_base_len(&mut rng);
-        let base = random_dna(&mut rng, base_len);
-        let n_reads = 4 + rng.below(4) as usize; // 4..=7 reads
+        let types = [
+            AlignmentType::Global,
+            AlignmentType::Local,
+            AlignmentType::Overlap,
+        ];
+        let scorings: [(&str, Scoring); 3] = [
+            ("linear", linear_scoring()),
+            ("affine", affine_scoring()),
+            ("convex", convex_scoring()),
+        ];
 
-        let scoring = convex_scoring();
-        let mut exact = SimdEngine::new(AlignmentType::Global, scoring);
-        let mut banded = SimdEngine::banded(AlignmentType::Global, scoring, BandConfig::default());
+        for (type_index, alignment_type) in types.into_iter().enumerate() {
+            for (mode_index, (mode, scoring)) in scorings.into_iter().enumerate() {
+                // Independent RNG per (type, mode) pair, still deterministically derived from the
+                // proptest seed plus the pair index, so a failure's exact family is reproducible from
+                // the seed printed in the failure message below.
+                let pair_index = (type_index * scorings.len() + mode_index) as u64;
+                let mut rng = Rng::new(seed ^ pair_index.wrapping_mul(0xD1B5_4A32_D192_ED03));
+                let base_len = random_base_len(&mut rng);
+                let base = random_dna(&mut rng, base_len);
+                let n_reads = 4 + rng.below(4) as usize; // 4..=7 reads
 
-        let mut graph = Graph::new();
-        for i in 0..n_reads {
-            let read = if i == 0 {
-                base.clone()
-            } else {
-                with_edits(&mut rng, &base, 30) // wide indels: reliably overflow the default band
-            };
+                let mut exact = SimdEngine::new(alignment_type, scoring);
+                let mut banded = SimdEngine::banded(alignment_type, scoring, BandConfig::default());
 
-            let (align_exact, score_exact) = exact.align(&read, &graph);
-            let (_align_banded, score_banded) = banded.align(&read, &graph);
+                let mut graph = Graph::new();
+                for i in 0..n_reads {
+                    let read = if i == 0 {
+                        base.clone()
+                    } else {
+                        with_edits(&mut rng, &base, 30) // wide indels: reliably overflow the default band
+                    };
 
-            prop_assert!(
-                score_banded <= score_exact,
-                "banded score {} beat exact score {} for read {} (seed={}) — sentinel leak?",
-                score_banded, score_exact, i, seed
-            );
+                    let (align_exact, score_exact) = exact.align(&read, &graph);
+                    let (_align_banded, score_banded) = banded.align(&read, &graph);
 
-            // Fold the EXACT alignment in, so both engines always face the identical graph.
-            add(&mut graph, &align_exact, &read);
+                    prop_assert!(
+                        score_banded <= score_exact,
+                        "banded score {} beat exact score {} for read {} \
+                         (type={:?} mode={} seed={}) — sentinel leak?",
+                        score_banded, score_exact, i, alignment_type, mode, seed
+                    );
+
+                    // Fold the EXACT alignment in, so both engines always face the identical graph.
+                    add(&mut graph, &align_exact, &read);
+                }
+            }
         }
     }
 

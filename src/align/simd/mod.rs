@@ -962,7 +962,9 @@ impl AlignmentEngine for SimdEngine {
         });
 
         match escalation {
-            // Worst case overflows even i32: no vectorized kernel is safe at any ISA.
+            // Worst case overflows even i32: no vectorized kernel is safe at any ISA. Note: when
+            // `self.band` is `Some`, this silently returns the EXACT (unbanded) `SisdEngine` result
+            // instead of a banded one — safe because exact >= banded (never wrong, just not sped up).
             Escalation::Fallback => self.inner.align(seq, graph),
             Escalation::Int32 => match isa {
                 Isa::Avx2 => {
@@ -1124,6 +1126,10 @@ impl AlignmentEngine for SimdEngine {
                         self.inner.align(seq, graph)
                     }
                 }
+                // No usable vectorized ISA on this host: delegate to the scalar `SisdEngine`. Note:
+                // when `self.band` is `Some`, this silently returns the EXACT (unbanded) result
+                // instead of a banded one — safe because exact >= banded (never wrong, just not
+                // sped up).
                 Isa::None => self.inner.align(seq, graph),
             },
             Escalation::Int16 => match isa {
@@ -1285,6 +1291,10 @@ impl AlignmentEngine for SimdEngine {
                         self.inner.align(seq, graph)
                     }
                 }
+                // No usable vectorized ISA on this host: delegate to the scalar `SisdEngine`. Note:
+                // when `self.band` is `Some`, this silently returns the EXACT (unbanded) result
+                // instead of a banded one — safe because exact >= banded (never wrong, just not
+                // sped up).
                 Isa::None => self.inner.align(seq, graph),
             },
         }
