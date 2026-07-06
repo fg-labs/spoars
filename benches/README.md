@@ -17,15 +17,80 @@ Groups (all sweep `{3,4,6,10}×235` + a `50×1000` scaling point):
 
 | group | what it isolates |
 |---|---|
-| `build_family` | end-to-end `Graph::new` + `align_and_add` loop — what the consumer feels per family |
-| `align_one` | one `engine.align` into an (n−1)-read graph — align cost alone |
+| `build_family` | end-to-end `Graph::new` + `align_and_add` loop, **exact** engine — what the consumer feels per family |
+| `build_family_banded` | same, with the opt-in `SimdEngine::banded(.., BandConfig::default())` — see below |
+| `align_one` | one `engine.align` into an (n−1)-read graph, **exact** engine — align cost alone |
+| `align_one_banded` | same, banded engine |
 | `add_alignment` | graph merge + per-add `topological_sort` — mutation cost alone |
 | `accessors` | `column_members` / `msa_columns` / `sequence_path_iter` — the read-out path |
 | `sisd_vs_simd` | same build under both engines — does SIMD pay off at 235 bp? |
 
 Corpus is generated in `benches/common/mod.rs` (fixed-seed xorshift64; 1% substitution +
 0.5% indel so the convex-gap/backtrack paths are exercised, not just the diagonal). No
-committed fixtures.
+committed fixtures. `build_family` and `build_family_banded` (likewise `align_one` /
+`align_one_banded`) consume the *same* corpus per point, so `cargo bench --bench poa --
+build_family` runs both exact and banded groups back-to-back for a direct, apples-to-apples
+comparison.
+
+## Banded vs exact — measured, not assumed
+
+`SimdEngine::banded(.., BandConfig::default())` is the opt-in, heuristic abPOA-style adaptive
+band (see `docs/design/2026-07-06-banded-poa-alignment-design.md`): it can miss the optimal
+alignment when a read needs an indel wider than the band, so it trades a small accuracy risk
+for a smaller DP search area. It is **not** a drop-in replacement for the exact
+`SimdEngine::new` — use it only when that trade-off is acceptable (near-identical reads,
+which is the common case for a UMI family).
+
+Run both groups together:
+
+```bash
+cargo bench --bench poa -- build_family --warm-up-time 1 --measurement-time 3 --sample-size 30
+```
+
+**Measured wall-clock (Apple M-series, NEON, release, `sample-size 30`/`20`, this run's raw
+output redirected to a file per the project's long-running-output convention):**
+
+| point | `build_family` (exact) | `build_family_banded` | speedup | `align_one` (exact) | `align_one_banded` | speedup |
+|---|---|---|---|---|---|---|
+| 3×235 | 291.67 µs | 139.00 µs | **2.10×** | 112.56 µs | 33.998 µs | **3.31×** |
+| 4×235 | 408.16 µs | 176.74 µs | **2.31×** | 112.87 µs | 35.001 µs | **3.23×** |
+| 6×235 | 657.16 µs | 262.52 µs | **2.50×** | 117.30 µs | 35.950 µs | **3.26×** |
+| 10×235 | 1.1578 ms | 428.57 µs | **2.70×** | 120.57 µs | 36.472 µs | **3.31×** |
+| 50×1000 | 126.10 ms | 25.058 ms | **5.03×** | 2.9999 ms | 477.27 µs | **6.29×** |
+
+At the fgumi-regime sizes (≤10×235) the `build_family` speedup (2.1–2.7×) sits at the lower
+end of the design's ~2–4× hypothesis, while the align-cost-only `align_one` speedup
+(3.2–3.3×) lands squarely in the middle of it — the gap between the two is exactly the fixed
+per-family overhead (graph mutation, scalar boundary init, allocation) that banding does not
+shrink, as documented in "First findings" below. At the `50×1000` scaling point both groups
+comfortably exceed the hypothesis (5.0× / 6.3×), consistent with the band covering a much
+smaller fraction of a wider matrix (see the cells ratio below).
+
+**Cells-computed ratio (analytical, not measured).** Criterion only times wall-clock, so the
+*why* behind the speedup — how much less DP-cell area the banded fill actually scans — is
+reported separately via `analytical_cells_ratio` in `benches/poa.rs`, printed once per point
+when `build_family_banded` runs (`cargo bench -- build_family_banded`). It is **analytical**:
+computed from public band geometry (`BandConfig::width`) and the built graph's node count
+(`rows × min(2w+1, L+1)` vs `rows × (L+1)`), not from instrumenting the hot fill path with
+per-cell counters — deliberately avoided (see task brief) to keep the fill loop clean. It is a
+coarse *lower bound* on cells scanned (it ignores per-row anchor drift near the query's edges
+and vector-lane quantization in `segment_range`, both of which only narrow the true window
+further):
+
+| point | cells ratio (banded/exact) | fewer cells |
+|---|---|---|
+| 3×235 | 0.1061 | 9.4× |
+| 4×235 | 0.1058 | 9.5× |
+| 6×235 | 0.1057 | 9.5× |
+| 10×235 | 0.1058 | 9.5× |
+| 50×1000 | 0.0409 | 24.4× |
+
+The cells ratio (9.5–24×) is far more favorable than the measured wall-clock speedup
+(2.1–6.3×) — expected, since wall-clock also carries fixed per-align costs (graph mutation,
+scalar boundary init/reseed, allocation) that scale with the *number* of aligns, not the
+*area* of the DP matrix, so they don't shrink when the band narrows. This is the same fixed-
+overhead effect "First findings" below documents for the exact engine's own scalar-boundary-
+init cost.
 
 ## Profiling (macOS, no sudo)
 

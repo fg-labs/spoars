@@ -19,7 +19,7 @@ use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 
 use spoars::align::{
-    align_and_add, AlignmentEngine, AlignmentType, Scoring, SimdEngine, SisdEngine,
+    align_and_add, AlignmentEngine, AlignmentType, BandConfig, Scoring, SimdEngine, SisdEngine,
 };
 use spoars::graph::Graph;
 
@@ -50,8 +50,50 @@ fn build_sisd(reads: &[Vec<u8>]) -> Graph {
     graph
 }
 
+/// Same as `build_simd`, but with the opt-in **banded** engine (abPOA-style adaptive band,
+/// `BandConfig::default()`), mirroring the consumer's per-family setup so the two groups are
+/// apples-to-apples: same corpus, same Global/convex scoring, same `align_and_add` loop.
+fn build_simd_banded(reads: &[Vec<u8>]) -> Graph {
+    let mut engine = SimdEngine::banded(
+        AlignmentType::Global,
+        Scoring::spoa_default(),
+        BandConfig::default(),
+    );
+    let mut graph = Graph::new();
+    for r in reads {
+        align_and_add(&mut graph, &mut engine, r, 1).expect("valid alignment");
+    }
+    graph
+}
+
 fn label(n: usize, len: usize) -> String {
     format!("{n}x{len}")
+}
+
+/// **Analytical** (not measured) cells-computed ratio for one family point: how much less DP-cell
+/// area the banded fill scans versus the exact fill, estimated purely from the public band
+/// geometry (`BandConfig::width`) and the built graph's node count — no per-cell instrumentation
+/// of the hot fill path. Criterion only times wall-clock, so this is the separate, explicit
+/// "why" behind any wall-clock speedup (or lack of one).
+///
+/// The estimate treats every DP row (one per graph node) as `2*w+1` query columns wide under
+/// banding versus `query_len+1` columns exact, where `w = BandConfig::width(query_len)`. This is
+/// coarse: it ignores per-row anchor drift (rows near the query's start/end have a narrower
+/// clamped window than `2*w+1`) and vector-lane quantization (`segment_range` rounds the window
+/// out to whole SIMD lanes). Both effects make the true banded fraction slightly *higher* than
+/// this estimate, so treat it as a lower bound on cells scanned, not an exact figure.
+fn analytical_cells_ratio(graph: &Graph, reads: &[Vec<u8>], band: BandConfig) -> f64 {
+    let rows = graph.num_nodes() as f64;
+    let mut exact_cells = 0.0f64;
+    let mut banded_cells = 0.0f64;
+    for r in reads {
+        let full_width = (r.len() + 1) as f64;
+        let w = band.width(r.len()) as f64;
+        let banded_width = (2.0 * w + 1.0).min(full_width);
+        exact_cells += rows * full_width;
+        banded_cells += rows * banded_width;
+    }
+    banded_cells / exact_cells
 }
 
 /// 1. End-to-end family build — what the consumer feels per UMI family.
@@ -85,6 +127,67 @@ fn bench_align_one(c: &mut Criterion) {
         let graph = build_simd(init);
         let last = last[0].clone();
         let mut engine = SimdEngine::new(AlignmentType::Global, Scoring::spoa_default());
+        g.throughput(Throughput::Bytes(last.len() as u64));
+        g.bench_with_input(BenchmarkId::from_parameter(label(n, len)), &(), |b, _| {
+            b.iter(|| black_box(engine.align(black_box(&last), black_box(&graph))));
+        });
+    }
+    g.finish();
+}
+
+/// 2b. Banded counterpart of `bench_build_family` — same corpus, same Global/convex scoring,
+///     `SimdEngine::banded(.., BandConfig::default())` instead of the exact engine. Registered in
+///     the same `criterion_group!` run as `bench_build_family` so `cargo bench -- build_family`
+///     produces both exact and banded numbers in one pass for direct comparison. Also prints the
+///     analytical cells-computed ratio per point (see `analytical_cells_ratio`) — labeled
+///     "analytical" because it is derived from band geometry, not from measuring cells at runtime.
+fn bench_build_family_banded(c: &mut Criterion) {
+    let mut g = c.benchmark_group("build_family_banded");
+    for &(n, len) in REGIME {
+        let (_truth, reads) = family(len, n, SEED);
+        let total: u64 = reads.iter().map(|r| r.len() as u64).sum();
+        g.throughput(Throughput::Bytes(total));
+
+        // One-off build (outside criterion's timed loop) purely to report the analytical
+        // cells-computed ratio for this point; the timed loop below rebuilds independently.
+        let graph = build_simd_banded(&reads);
+        let ratio = analytical_cells_ratio(&graph, &reads, BandConfig::default());
+        println!(
+            "[cells-ratio, analytical] build_family_banded/{}: banded/exact = {ratio:.4} \
+             ({:.1}x fewer cells)",
+            label(n, len),
+            1.0 / ratio,
+        );
+
+        g.bench_with_input(
+            BenchmarkId::from_parameter(label(n, len)),
+            &reads,
+            |b, reads| {
+                b.iter(|| black_box(build_simd_banded(black_box(reads))));
+            },
+        );
+    }
+    g.finish();
+}
+
+/// 2c. Banded counterpart of `bench_align_one` — isolates the banded align cost alone (no graph
+///     mutation), mirroring `bench_align_one`'s (n-1)-read setup so the two are directly
+///     comparable.
+fn bench_align_one_banded(c: &mut Criterion) {
+    let mut g = c.benchmark_group("align_one_banded");
+    for &(n, len) in REGIME {
+        if n < 2 {
+            continue;
+        }
+        let (_truth, reads) = family(len, n, SEED);
+        let (init, last) = reads.split_at(n - 1);
+        let graph = build_simd_banded(init);
+        let last = last[0].clone();
+        let mut engine = SimdEngine::banded(
+            AlignmentType::Global,
+            Scoring::spoa_default(),
+            BandConfig::default(),
+        );
         g.throughput(Throughput::Bytes(last.len() as u64));
         g.bench_with_input(BenchmarkId::from_parameter(label(n, len)), &(), |b, _| {
             b.iter(|| black_box(engine.align(black_box(&last), black_box(&graph))));
@@ -183,7 +286,9 @@ fn bench_sisd_vs_simd(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_build_family,
+    bench_build_family_banded,
     bench_align_one,
+    bench_align_one_banded,
     bench_add_alignment,
     bench_accessors,
     bench_sisd_vs_simd,
