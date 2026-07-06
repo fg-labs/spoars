@@ -155,8 +155,38 @@ fn seed_striped_row0<S>(
 /// The caller guarantees `seq_len >= 1` and a non-empty `graph` (both short-circuited earlier in
 /// [`super::SimdEngine::align`]), so `matrix_width_vecs >= 1`.
 ///
-/// `band` is plumbing for the (not-yet-active) banded fill: `None` reproduces today's full-matrix
-/// behavior exactly; it is otherwise unused for now.
+/// # Banded mode (`band = Some(..)`)
+///
+/// When `band` is supplied each graph row computes only the striped segments `[beg_sn, end_sn)` of
+/// its abPOA-style window (§Fill clip of the design doc); out-of-band segments keep their
+/// resize-refilled [`Simd::NEG_INF`] init. `None` reproduces today's full-matrix behavior **exactly**
+/// (`(0, matrix_width_vecs, 0)` window, no carry-seed change), which the parity suite pins.
+///
+/// The clip's correctness crux is that the two lane-0 carries are seeded **oppositely** at the band's
+/// left edge (`beg_sn > 0`):
+///
+/// - **Diagonal carry** (the first-/additional-predecessor pass) — seeded from the predecessor buffer
+///   at segment `beg_sn - 1` (`srli_top_lane(striped_h[pred_base + beg_sn - 1])`), NOT closed. That
+///   cell is normally inside the predecessor's overlapping band and holds the real match transition
+///   `H_pred[beg-1] + s`, the dominant term for near-identical reads; closing it to `NEG_INF` would
+///   discard that transition and make left-edge in-band cells differ from exact. Because the buffer is
+///   full-width and refilled to `NEG_INF`, this naturally yields `NEG_INF` iff that predecessor cell
+///   is itself out of band — the correct behavior with no special case.
+/// - **Horizontal carry** (the `prefix_max` pass) — closed to `NEG_INF` (`splat(NEG_INF)`), ksw2-style
+///   edge closure. It represents *this row's own* running value at column `beg-1`, which a banded row
+///   genuinely never computes (and which is not the boundary column 0); injecting any finite value
+///   would fabricate a horizontal gap from column 0 with the skipped-segment penalties missing.
+///
+/// The banded arithmetic uses saturating [`Simd::adds`] so an interior out-of-band `NEG_INF` sentinel,
+/// which a drifting band edge can penalize across many rows (`NEG_INF + k·g`), stays pinned at
+/// `NEG_INF` instead of wrapping int16/int32 to a large positive and winning a `max`. On real
+/// (non-sentinel) DP values `adds` is bit-identical to `add` (the escalation guard keeps real values
+/// far from the saturation threshold), so it is used uniformly on both the `None` and `Some` paths —
+/// the parity suite confirms `None` stays bit-exact.
+///
+/// SW/OV max-tracking (and the recorded `best_col`) reduce over the in-band segments only. Global
+/// endpoint handling is unchanged here (a later task makes it band-aware); the banded gate targets
+/// [`AlignmentType::Local`].
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) fn fill_linear<S>(
@@ -169,13 +199,12 @@ pub(crate) fn fill_linear<S>(
     masks: &[S::Vec],
     penalties: &[S::Vec],
     striped_h: &mut Vec<S::Vec>,
-    band: Option<&mut BandState>,
+    mut band: Option<&mut BandState>,
 ) -> (usize, usize, i32)
 where
     S: Simd,
     S::Elem: ElemFromI32 + ElemToI32,
 {
-    let _ = &band;
     let lanes = S::LANES;
     let matrix_width_vecs = seq_len.div_ceil(lanes);
     let matrix_width = seeded.matrix_width; // seq_len + 1 (row-major width)
@@ -228,6 +257,37 @@ where
         let profile_base = node.code as usize * matrix_width_vecs;
         let row_base = i * matrix_width_vecs;
 
+        // This row's banded window in striped segments: `[beg_sn, end_sn)`; `beg_col = beg_sn * lanes`
+        // is its first query column (only needed to translate the in-band `index_of` into an absolute
+        // `best_col`). `None` yields the full row `(0, matrix_width_vecs, 0)`, so the loops below and
+        // the carry seeds are byte-identical to the unbanded path. `Some` derives the window from the
+        // node's anchor unioned with its predecessors' recorded `best_col` (§Band computation), then
+        // floors/ceils to segment boundaries (§segment_range).
+        let (beg_sn, end_sn, beg_col) = match band.as_deref() {
+            Some(state) => {
+                let rank = node_id_to_rank[node_id.0 as usize] as usize;
+                let anchor = super::band::anchor(state.r[rank], seq_len);
+                let (mstart, mend) = if node.inedges.is_empty() {
+                    (anchor, anchor)
+                } else {
+                    let mut lo = usize::MAX;
+                    let mut hi = 0usize;
+                    for &edge_id in &node.inedges {
+                        let tail = graph.edges[edge_id.0 as usize].tail;
+                        let pr = node_id_to_rank[tail.0 as usize] as usize;
+                        let bc = state.best_col[pr] as usize;
+                        lo = lo.min(bc);
+                        hi = hi.max(bc);
+                    }
+                    (lo, hi)
+                };
+                let (beg, end) = super::band::node_window(anchor, mstart, mend, state.w, seq_len);
+                let (bs, es) = super::band::segment_range(beg, end, lanes, matrix_width_vecs);
+                (bs, es, bs * lanes)
+            }
+            None => (0, matrix_width_vecs, 0),
+        };
+
         // First predecessor: diagonal (with carry) + vertical (impl:773-795).
         let mut pred_i = if node.inedges.is_empty() {
             0
@@ -235,50 +295,84 @@ where
             pred_row(node.inedges[0])
         };
         let pred_base = pred_i * matrix_width_vecs;
-        let mut x = S::srli_top_lane(S::splat(S::Elem::from_i32(first_column(pred_i))));
-        for j in 0..matrix_width_vecs {
+        // DIAGONAL carry: at the band's left edge seed from the PREDECESSOR buffer's top lane at
+        // segment `beg_sn - 1` (real value, or `NEG_INF` if that pred cell is itself out of band).
+        // Do NOT close to `NEG_INF` — that would drop the match transition `H_pred[beg-1] + s`.
+        let mut x = if beg_sn == 0 {
+            S::srli_top_lane(S::splat(S::Elem::from_i32(first_column(pred_i))))
+        } else {
+            S::srli_top_lane(striped_h[pred_base + (beg_sn - 1)])
+        };
+        for j in beg_sn..end_sn {
             let h_pred = striped_h[pred_base + j];
             let t1 = S::srli_top_lane(h_pred);
             let diag = S::or(S::slli_one_lane(h_pred), x);
             x = t1;
             let value = S::max(
-                S::add(diag, profile[profile_base + j]),
-                S::add(h_pred, g_vec),
+                S::adds(diag, profile[profile_base + j]),
+                S::adds(h_pred, g_vec),
             );
             striped_h[row_base + j] = value;
         }
 
-        // Additional predecessors: fold in with max (impl:796-821).
+        // Additional predecessors: fold in with max (impl:796-821). Same diagonal-carry seeding.
         for p in 1..node.inedges.len() {
             pred_i = pred_row(node.inedges[p]);
             let pred_base = pred_i * matrix_width_vecs;
-            let mut x = S::srli_top_lane(S::splat(S::Elem::from_i32(first_column(pred_i))));
-            for j in 0..matrix_width_vecs {
+            let mut x = if beg_sn == 0 {
+                S::srli_top_lane(S::splat(S::Elem::from_i32(first_column(pred_i))))
+            } else {
+                S::srli_top_lane(striped_h[pred_base + (beg_sn - 1)])
+            };
+            for j in beg_sn..end_sn {
                 let h_pred = striped_h[pred_base + j];
                 let t1 = S::srli_top_lane(h_pred);
                 let m = S::or(S::slli_one_lane(h_pred), x);
                 x = t1;
                 let cur = striped_h[row_base + j];
-                let candidate = S::max(S::add(m, profile[profile_base + j]), S::add(h_pred, g_vec));
+                let candidate = S::max(
+                    S::adds(m, profile[profile_base + j]),
+                    S::adds(h_pred, g_vec),
+                );
                 striped_h[row_base + j] = S::max(cur, candidate);
             }
         }
 
         // Horizontal gap (prefix_max) + inter-segment carry, then the per-row score (impl:823-846).
+        // HORIZONTAL carry: at the band's left edge close to `NEG_INF` (ksw2-style edge closure) — the
+        // column `beg-1` is genuinely uncomputed in THIS row and is not the boundary column 0.
         let mut score = S::splat(S::NEG_INF);
-        let mut x = S::srli_top_lane(S::add(S::splat(S::Elem::from_i32(first_column(i))), g_vec));
-        for j in 0..matrix_width_vecs {
+        let mut x = if beg_sn == 0 {
+            S::srli_top_lane(S::add(S::splat(S::Elem::from_i32(first_column(i))), g_vec))
+        } else {
+            S::splat(S::NEG_INF)
+        };
+        for j in beg_sn..end_sn {
             let mut hv = striped_h[row_base + j];
             hv = S::max(hv, S::or(x, carry_mask));
             // NOTE: trait arg order is (penalties, masks) — transposed vs upstream's (masks,
             // penalties) — see the `Simd::prefix_max` doc and the Task 6 review.
             hv = S::prefix_max(hv, penalties, masks);
-            x = S::srli_top_lane(S::add(hv, g_vec));
+            x = S::srli_top_lane(S::adds(hv, g_vec));
             if alignment_type == AlignmentType::Local {
                 hv = S::max(hv, zeroes);
             }
             striped_h[row_base + j] = hv;
             score = S::max(score, hv);
+        }
+
+        // Record this row's max query column into `best_col[rank]` (banded only). Uses the
+        // `LANES`-independent `index_of` flat-scan over the IN-BAND slice (determinism across ISAs,
+        // §best_col propagation), offset by `beg_col`; the next row's Mstart/Mend read it.
+        if let Some(state) = band.as_deref_mut() {
+            let rank = node_id_to_rank[node_id.0 as usize] as usize;
+            let row_best = S::horizontal_max(score).to_i32();
+            let col = index_of::<S>(
+                &striped_h[row_base + beg_sn..row_base + end_sn],
+                end_sn - beg_sn,
+                row_best,
+            );
+            state.best_col[rank] = (beg_col as i32 + col).max(0) as u32;
         }
 
         // Per-type max-score tracking (impl:848-872). STRICT `<` keeps the earlier row on a tie.
@@ -790,4 +884,346 @@ where
     };
 
     (max_i, max_j, max_score)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::align::simd::band::{self, BandConfig, BandState};
+    use crate::align::simd::profile::{build_masks, build_penalties, build_profile};
+    use crate::align::sisd::{reseed_scalar_buffers, ScalarInit};
+    use crate::graph::{Graph, NodeId};
+
+    // A real multi-lane backend (LANES == 8) so the striped carry seeding is genuinely exercised;
+    // the degenerate `ScalarSimd` (LANES == 1) would validate none of the cross-lane shift logic.
+    #[cfg(target_arch = "aarch64")]
+    type TestSimd = crate::align::simd::neon::NeonI16;
+    #[cfg(target_arch = "x86_64")]
+    type TestSimd = crate::align::simd::sse41::Sse41I16;
+
+    /// Reads DP cell `(row i, 0-based query column j)` out of a striped H buffer.
+    fn cell<S>(striped: &[S::Vec], matrix_width_vecs: usize, i: usize, j: usize) -> i32
+    where
+        S: Simd,
+        S::Elem: ElemFromI32 + ElemToI32,
+    {
+        let seg = j / S::LANES;
+        let lane = j % S::LANES;
+        let mut buf = vec![S::Elem::from_i32(0); S::LANES];
+        S::storeu(striped[i * matrix_width_vecs + seg], &mut buf);
+        buf[lane].to_i32()
+    }
+
+    /// Recomputes each graph row's banded window `(beg, end, beg_sn, end_sn)` from a *finalized*
+    /// [`BandState`]. Because `best_col[rank]` is written exactly once (when its row is filled) and
+    /// every predecessor has a strictly-lower rank, the post-run `best_col` equals the values the
+    /// fill read while building each row — so this reproduces the identical band deterministically.
+    /// Mirrors the window derivation inside [`fill_linear`] exactly.
+    fn recompute_window(
+        graph: &Graph,
+        node_id_to_rank: &[u32],
+        state: &BandState,
+        node_id: crate::graph::NodeId,
+        seq_len: usize,
+        lanes: usize,
+        matrix_width_vecs: usize,
+    ) -> (usize, usize, usize, usize) {
+        let node = &graph.nodes[node_id.0 as usize];
+        let rank = node_id_to_rank[node_id.0 as usize] as usize;
+        let anchor = band::anchor(state.r[rank], seq_len);
+        let (mstart, mend) = if node.inedges.is_empty() {
+            (anchor, anchor)
+        } else {
+            let mut lo = usize::MAX;
+            let mut hi = 0usize;
+            for &edge_id in &node.inedges {
+                let tail = graph.edges[edge_id.0 as usize].tail;
+                let pr = node_id_to_rank[tail.0 as usize] as usize;
+                let bc = state.best_col[pr] as usize;
+                lo = lo.min(bc);
+                hi = hi.max(bc);
+            }
+            (lo, hi)
+        };
+        let (beg, end) = band::node_window(anchor, mstart, mend, state.w, seq_len);
+        let (beg_sn, end_sn) = band::segment_range(beg, end, lanes, matrix_width_vecs);
+        (beg, end, beg_sn, end_sn)
+    }
+
+    /// Builds the scalar seed / striped profile / prefix-max ladders for a linear-gap fill, then runs
+    /// [`fill_linear`] once. Factored so the exact and banded runs share identical setup.
+    fn run_linear(
+        graph: &Graph,
+        seq: &[u8],
+        scoring: Scoring,
+        alignment_type: AlignmentType,
+        striped_h: &mut Vec<<TestSimd as Simd>::Vec>,
+        band: Option<&mut BandState>,
+    ) -> (usize, usize, i32) {
+        let mut seeded = ScalarInit::default();
+        reseed_scalar_buffers(&mut seeded, alignment_type, scoring, seq, graph);
+        let mut profile: Vec<<TestSimd as Simd>::Vec> = Vec::new();
+        build_profile::<TestSimd>(&mut profile, graph, seq, scoring);
+        let masks = build_masks::<TestSimd>(<TestSimd as Simd>::NEG_INF);
+        let penalties = build_penalties::<TestSimd>(
+            <<TestSimd as Simd>::Elem as ElemFromI32>::from_i32(i32::from(scoring.g)),
+        );
+        fill_linear::<TestSimd>(
+            graph,
+            seq.len(),
+            scoring,
+            alignment_type,
+            &seeded,
+            &profile,
+            &masks,
+            &penalties,
+            striped_h,
+            band,
+        )
+    }
+
+    /// PRIMARY per-cell banded gate (design §Correctness gate 1). A narrow band (`base = 2`) over an
+    /// identical-read fixture long enough that the window's segment start drifts to `beg_sn >= 1` on
+    /// deep rows — the ONLY configuration that exercises the corrected left-edge carry seeding.
+    /// Asserts (a) at least one row actually reached `beg_sn >= 1` (the gate is not vacuous), (b) the
+    /// banded `(max_i, max_j, max_score)` equals the exact one, and (c) every in-band cell of the
+    /// banded `H` equals the exact `H` — proving the diagonal carry recovered the match transition at
+    /// the band's left edge (a closed-to-`NEG_INF` diagonal carry would make these cells too low).
+    #[test]
+    fn banded_linear_in_band_cells_match_exact_at_beg_sn_ge_1() {
+        let lanes = <TestSimd as Simd>::LANES;
+        // A non-repetitive 48-mer; identical query so the optimum is the exact diagonal (in band).
+        let seq = b"ACGTTGCAGATCCGTAAGCTTACGGATCAGTTCAGGATCACGTTGCAA";
+        let seq_len = seq.len();
+        let matrix_width_vecs = seq_len.div_ceil(lanes);
+        let scoring = Scoring::new(5, -4, -8, -6, -10, -4).unwrap();
+        let alignment_type = AlignmentType::Local;
+
+        let mut graph = Graph::new();
+        graph.add_alignment_weight(&[], seq, 1).unwrap();
+
+        // Exact (full-matrix) fill.
+        let mut h_exact: Vec<<TestSimd as Simd>::Vec> = Vec::new();
+        let exact_max = run_linear(&graph, seq, scoring, alignment_type, &mut h_exact, None);
+
+        // Banded fill with a deliberately narrow window.
+        let node_id_to_rank = {
+            let mut m = vec![0u32; graph.num_nodes()];
+            for (rank, &node_id) in graph.rank_order().iter().enumerate() {
+                m[node_id.0 as usize] = rank as u32;
+            }
+            m
+        };
+        let mut band = BandState::new(
+            &graph,
+            &node_id_to_rank,
+            seq_len,
+            BandConfig { base: 2, frac: 0.0 },
+        );
+        let mut h_band: Vec<<TestSimd as Simd>::Vec> = Vec::new();
+        let band_max = run_linear(
+            &graph,
+            seq,
+            scoring,
+            alignment_type,
+            &mut h_band,
+            Some(&mut band),
+        );
+
+        // (b) The banded optimum equals the exact optimum (the path stayed in band).
+        assert_eq!(
+            band_max, exact_max,
+            "banded (max_i, max_j, max_score) != exact"
+        );
+
+        // (a) + (c): recompute every row's window from the finalized band, assert in-band equality,
+        // and confirm the risky `beg_sn >= 1` seeding actually ran on at least one row.
+        let mut saw_beg_sn_ge_1 = false;
+        for &node_id in &graph.rank_to_node {
+            let i = node_id_to_rank[node_id.0 as usize] as usize + 1;
+            let (beg, end, beg_sn, end_sn) = recompute_window(
+                &graph,
+                &node_id_to_rank,
+                &band,
+                node_id,
+                seq_len,
+                lanes,
+                matrix_width_vecs,
+            );
+            if beg_sn >= 1 {
+                saw_beg_sn_ge_1 = true;
+            }
+            for j in beg..end {
+                assert_eq!(
+                    cell::<TestSimd>(&h_band, matrix_width_vecs, i, j),
+                    cell::<TestSimd>(&h_exact, matrix_width_vecs, i, j),
+                    "in-band cell mismatch at (row {i}, col {j}); window [{beg},{end}) segs [{beg_sn},{end_sn})",
+                );
+            }
+        }
+
+        assert!(
+            saw_beg_sn_ge_1,
+            "gate is vacuous: no row reached beg_sn >= 1 (band too wide for the fixture)",
+        );
+    }
+
+    /// Regression gate for the ADDITIONAL-predecessor diagonal-seed loop (`for p in
+    /// 1..node.inedges.len()` in [`fill_linear`]) — the primary gate above only exercises a linear
+    /// chain, where no node has more than one in-edge, so that loop's `beg_sn > 0` carry seed
+    /// (`srli_top_lane(striped_h[pred_base + beg_sn - 1])`) never runs.
+    ///
+    /// Builds a genuinely branching (reconvergent) POA graph: seed sequence `seq1`, then a second
+    /// sequence `seq2` identical to `seq1` except for a single interior substitution at `MISMATCH`,
+    /// aligned so every position maps onto `seq1`'s existing node at that index (`(i, i)` for every
+    /// `i`). At `MISMATCH` the mapped node's code differs from `seq2`'s base there, so
+    /// [`Graph::add_alignment`] takes its cross-link fork path automatically (`graph.cpp:207-231`),
+    /// creating a brand-new node aligned to (but distinct from) `seq1`'s node at that column. The
+    /// very next base then re-joins the ORIGINAL node one column later, giving that node two
+    /// in-edges: `seq1`'s original edge (first predecessor) and the new fork's edge (the additional
+    /// predecessor).
+    ///
+    /// Running the fill with query `seq2` makes the fork the DOMINANT (matching) predecessor at the
+    /// reconvergent node's row — the original edge's tail now mismatches `seq2` at `MISMATCH` — so
+    /// the additional-predecessor loop's diagonal transition determines the row's value there. The
+    /// fork's own row is one rank shallower and, at this `MISMATCH`, its window's left edge lands
+    /// in an EARLIER striped segment than the reconvergent row's (`fork_beg_sn < recon_beg_sn`,
+    /// asserted below): that is exactly what makes the seed's source cell (`pred_base + beg_sn -
+    /// 1`) a REAL, in-band value in the fork's buffer rather than a NEG_INF stub that would mask a
+    /// broken seed — i.e. why this specific `MISMATCH` (not an arbitrary one) makes the mutation
+    /// check below actually fail. `MISMATCH` was found by scanning candidate positions for this
+    /// exact `fork_beg_sn < recon_beg_sn` (with `recon_beg_sn >= 1`) property under the fixed
+    /// `BandConfig { base: 2, frac: 0.0 }`; nearby positions land both rows in the same segment and
+    /// would NOT catch the mutation despite `recon_beg_sn >= 1` alone holding.
+    #[test]
+    fn banded_linear_multi_predecessor_diagonal_seed() {
+        let lanes = <TestSimd as Simd>::LANES;
+        // A non-repetitive 120-mer, long enough that the reconvergent node's own row (rank
+        // MISMATCH + 1) drifts to `beg_sn >= 1`, one striped segment AHEAD of the fork's own row,
+        // under the same narrow `base = 2` band as the primary gate (see the doc comment above).
+        let seq1 = b"AAGCCCAATAAACCACTCTGACTGGCCGAATAGGGATATAGGCAACGACATGTGCGGCGACCCTTGCGACAGTGACGCTTTCGCCGTTGCCTAAACCTATTTGAAGGAGTCTAGCAGCCG";
+        const MISMATCH: usize = 42; // interior substitution column (0-based); see doc comment.
+        let seq_len = seq1.len();
+        assert_eq!(
+            seq_len, 120,
+            "fixture invariant: MISMATCH was tuned for this exact sequence"
+        );
+        let mut seq2 = seq1.to_vec();
+        let repl = *b"ACGT"
+            .iter()
+            .find(|&&b| b != seq1[MISMATCH])
+            .expect("ACGT has >1 distinct base");
+        seq2[MISMATCH] = repl;
+        let matrix_width_vecs = seq_len.div_ceil(lanes);
+        let scoring = Scoring::new(5, -4, -8, -6, -10, -4).unwrap();
+        let alignment_type = AlignmentType::Local;
+
+        // seq1 into a fresh graph: nodes 0..seq_len-1, node id == position (linear chain).
+        let mut graph = Graph::new();
+        graph.add_alignment_weight(&[], seq1, 1).unwrap();
+
+        // seq2 aligned identity-wise against seq1's existing nodes; the MISMATCH column's code
+        // mismatch triggers Graph::add_alignment's cross-link fork automatically.
+        let alignment: Vec<(i32, i32)> = (0..seq_len).map(|pos| (pos as i32, pos as i32)).collect();
+        graph.add_alignment_weight(&alignment, &seq2, 1).unwrap();
+
+        let reconvergent = NodeId(MISMATCH as u32 + 1);
+        assert!(
+            graph.nodes[reconvergent.0 as usize].inedges.len() >= 2,
+            "fixture invariant: node at MISMATCH + 1 must be reconvergent (>= 2 in-edges)"
+        );
+        let fork_node = *graph.nodes[MISMATCH]
+            .aligned_nodes
+            .first()
+            .expect("fixture invariant: MISMATCH's node must have forked an aligned node");
+
+        let node_id_to_rank = {
+            let mut m = vec![0u32; graph.num_nodes()];
+            for (rank, &node_id) in graph.rank_order().iter().enumerate() {
+                m[node_id.0 as usize] = rank as u32;
+            }
+            m
+        };
+
+        // Exact (full-matrix) fill, query = seq2 (the branch that makes the fork dominant).
+        let mut h_exact: Vec<<TestSimd as Simd>::Vec> = Vec::new();
+        let exact_max = run_linear(&graph, &seq2, scoring, alignment_type, &mut h_exact, None);
+
+        // Banded fill, same deliberately narrow window as the primary gate.
+        let mut band = BandState::new(
+            &graph,
+            &node_id_to_rank,
+            seq_len,
+            BandConfig { base: 2, frac: 0.0 },
+        );
+        let mut h_band: Vec<<TestSimd as Simd>::Vec> = Vec::new();
+        let band_max = run_linear(
+            &graph,
+            &seq2,
+            scoring,
+            alignment_type,
+            &mut h_band,
+            Some(&mut band),
+        );
+
+        assert_eq!(
+            band_max, exact_max,
+            "banded (max_i, max_j, max_score) != exact"
+        );
+
+        // The load-bearing geometry (see doc comment): the reconvergent row's window starts one
+        // striped segment AFTER the fork row's window, so the additional-pred loop's `beg_sn - 1`
+        // lookback into the fork's buffer lands on a REAL (in-band) cell, not a NEG_INF stub.
+        let (_, _, fork_beg_sn, _) = recompute_window(
+            &graph,
+            &node_id_to_rank,
+            &band,
+            fork_node,
+            seq_len,
+            lanes,
+            matrix_width_vecs,
+        );
+        let (_, _, recon_beg_sn, _) = recompute_window(
+            &graph,
+            &node_id_to_rank,
+            &band,
+            reconvergent,
+            seq_len,
+            lanes,
+            matrix_width_vecs,
+        );
+        assert!(
+            recon_beg_sn >= 1,
+            "gate does not exercise the additional-predecessor loop's beg_sn > 0 branch: the \
+             reconvergent node's own row never reached beg_sn >= 1"
+        );
+        assert!(
+            fork_beg_sn < recon_beg_sn,
+            "gate is vacuous: the fork's own row window [.., beg_sn={fork_beg_sn}) does not start \
+             strictly before the reconvergent row's (beg_sn={recon_beg_sn}), so the seed's source \
+             cell would be a NEG_INF stub in the fork's buffer either way"
+        );
+
+        // Per-cell in-band equality over every row (same shape as the primary gate) — proves the
+        // additional-predecessor loop's corrected diagonal seed recovered the match transition.
+        for &node_id in &graph.rank_to_node {
+            let i = node_id_to_rank[node_id.0 as usize] as usize + 1;
+            let (beg, end, beg_sn, end_sn) = recompute_window(
+                &graph,
+                &node_id_to_rank,
+                &band,
+                node_id,
+                seq_len,
+                lanes,
+                matrix_width_vecs,
+            );
+            for j in beg..end {
+                assert_eq!(
+                    cell::<TestSimd>(&h_band, matrix_width_vecs, i, j),
+                    cell::<TestSimd>(&h_exact, matrix_width_vecs, i, j),
+                    "in-band cell mismatch at (row {i}, col {j}); window [{beg},{end}) segs [{beg_sn},{end_sn})",
+                );
+            }
+        }
+    }
 }
