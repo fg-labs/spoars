@@ -1,12 +1,12 @@
 //! The per-ISA `Simd` trait: the vectorized-fill primitives every real ISA backend
-//! (SSE4.1/NEON/AVX2) will implement, plus a `ScalarSimd` (`LANES = 1`) reference impl.
+//! (SSE4.1/NEON/AVX2) implements, plus a `ScalarSimd` (`LANES = 1`) reference impl.
 //!
 //! Ports the `InstructionSet<Architecture, T>` template from
 //! `third_party/spoa/src/simd_alignment_engine_implementation.hpp` (`:59-220`) as a Rust trait:
 //! upstream picks one of three `InstructionSet` specializations (AVX2/int16, AVX2/int32,
 //! SSE4.1/int16, SSE4.1/int32) at compile time via preprocessor `#if`; this crate instead defines
 //! one associated-type-generic `Simd` trait and gives each (ISA, element width) pair its own
-//! implementing type, selected at runtime by the dispatch logic later tasks add.
+//! implementing type, selected at runtime by the dispatch logic in the parent [`super`] module.
 //!
 //! `ScalarSimd{I16,I32}` implement `Simd` with `Vec = Elem` and `LANES = 1`: no intrinsics, no
 //! `unsafe`. They exist purely so Task 3's generic DP fill can be written and unit-tested against
@@ -91,6 +91,22 @@ pub(crate) trait Simd {
     /// `dst` must have length `>= Self::LANES`.
     fn storeu(v: Self::Vec, dst: &mut [Self::Elem]);
 
+    /// Sign-extends all `Self::LANES` lanes of `v` to `i32` and stores them **contiguously** to the
+    /// front of `dst`. Exactly equivalent to [`Simd::storeu`] into a scratch buffer followed by a
+    /// per-lane `i32::from(elem)`, but without the store-then-narrow-reload roundtrip — for `i16`
+    /// backends it is one hardware sign-extend widen (`_mm_cvtepi16_epi32`/`_mm256_cvtepi16_epi32`/
+    /// `vmovl_s16`) per 128-bit half plus a wide store; for `i32` backends it is a plain store.
+    ///
+    /// This is the fast path for [`super::profile::destripe_interior`]: because this crate's profile
+    /// layout is *sequential* (lane `k` of segment `s` is sequence position `s * LANES + k`, see
+    /// [`super::profile::build_profile`]), a full segment's `LANES` lanes map to `LANES` *consecutive*
+    /// row-major columns, so de-striping a full segment is a contiguous widen-and-store rather than a
+    /// scatter. The output is bit-identical to the per-lane scalar path (sign extension matches
+    /// `i32::from`).
+    ///
+    /// `dst` must have length `>= Self::LANES`.
+    fn store_widened_i32(v: Self::Vec, dst: &mut [i32]);
+
     /// Shifts `v` left by `N` *bytes* (not lanes), zero-filling the vacated low-order bytes.
     /// Ports `_mmxxx_slli_si` (`impl:52-55,147-148`, e.g. `_mm_slli_si128`/`_mm256_slli_si256`).
     /// `N` is a compile-time constant, matching every real ISA's immediate-operand shift
@@ -150,6 +166,7 @@ pub(crate) trait Simd {
     ///
     /// Provided as a default method (not overridden by any impl): it is expressed purely in terms
     /// of the other trait ops, so `ScalarSimd`/`TestSimd4` and every real ISA inherit it unchanged.
+    #[inline(always)]
     fn prefix_max_step<const N: i32>(
         a: Self::Vec,
         penalty: Self::Vec,
@@ -187,48 +204,63 @@ impl Simd for ScalarSimdI16 {
     const RSS: i32 = 0;
     const NEG_INF: i16 = NEG_INF_I16;
 
+    #[inline(always)]
     fn splat(value: i16) -> i16 {
         value
     }
 
+    #[inline(always)]
     fn add(a: i16, b: i16) -> i16 {
         a.wrapping_add(b)
     }
 
+    #[inline(always)]
     fn sub(a: i16, b: i16) -> i16 {
         a.wrapping_sub(b)
     }
 
+    #[inline(always)]
     fn min(a: i16, b: i16) -> i16 {
         a.min(b)
     }
 
+    #[inline(always)]
     fn max(a: i16, b: i16) -> i16 {
         a.max(b)
     }
 
+    #[inline(always)]
     fn or(a: i16, b: i16) -> i16 {
         a | b
     }
 
+    #[inline(always)]
     fn loadu(src: &[i16]) -> i16 {
         src[0]
     }
 
+    #[inline(always)]
     fn storeu(v: i16, dst: &mut [i16]) {
         dst[0] = v;
+    }
+
+    #[inline(always)]
+    fn store_widened_i32(v: i16, dst: &mut [i32]) {
+        dst[0] = i32::from(v);
     }
 
     /// At `LANES = 1` there is no second lane to shift in, so — matching the plan's degenerate
     /// caveat — this returns [`Simd::NEG_INF`] directly rather than a raw zero-fill: it stands in
     /// for what a real ISA's `slli` composed with its `prefix_max` mask-OR would produce (a
     /// vacated lane reading as `NEG_INF`, not `0`).
+    #[inline(always)]
     fn slli<const N: i32>(_v: i16) -> i16 {
         Self::NEG_INF
     }
 
     /// See [`ScalarSimdI16::slli`]: the same one-lane degenerate NEG_INF fill, mirrored for the
     /// right shift.
+    #[inline(always)]
     fn srli<const N: i32>(_v: i16) -> i16 {
         Self::NEG_INF
     }
@@ -236,6 +268,7 @@ impl Simd for ScalarSimdI16 {
     /// Degenerate one-lane diagonal shift: shifting the single lane up leaves lane 0 vacated, so —
     /// like [`ScalarSimdI16::slli`] — this returns [`Simd::NEG_INF`]. Never exercised by a real
     /// fill at `LANES = 1` (see the module doc).
+    #[inline(always)]
     fn slli_one_lane(_v: i16) -> i16 {
         Self::NEG_INF
     }
@@ -243,16 +276,19 @@ impl Simd for ScalarSimdI16 {
     /// Degenerate one-lane carry shift: with `LANES = 1` there is no higher lane to isolate, so —
     /// like [`ScalarSimdI16::srli`] — this returns [`Simd::NEG_INF`]. Never exercised by a real
     /// fill at `LANES = 1`.
+    #[inline(always)]
     fn srli_top_lane(_v: i16) -> i16 {
         Self::NEG_INF
     }
 
+    #[inline(always)]
     fn horizontal_max(v: i16) -> i16 {
         0i16.max(v)
     }
 
     /// Identity: `LOG_LANES == 0` means zero ladder steps, so `penalties`/`masks` (both always
     /// empty here) are never read.
+    #[inline(always)]
     fn prefix_max(v: i16, _penalties: &[i16], _masks: &[i16]) -> i16 {
         v
     }
@@ -274,64 +310,83 @@ impl Simd for ScalarSimdI32 {
     const RSS: i32 = 0;
     const NEG_INF: i32 = NEG_INF_I32;
 
+    #[inline(always)]
     fn splat(value: i32) -> i32 {
         value
     }
 
+    #[inline(always)]
     fn add(a: i32, b: i32) -> i32 {
         a.wrapping_add(b)
     }
 
+    #[inline(always)]
     fn sub(a: i32, b: i32) -> i32 {
         a.wrapping_sub(b)
     }
 
+    #[inline(always)]
     fn min(a: i32, b: i32) -> i32 {
         a.min(b)
     }
 
+    #[inline(always)]
     fn max(a: i32, b: i32) -> i32 {
         a.max(b)
     }
 
+    #[inline(always)]
     fn or(a: i32, b: i32) -> i32 {
         a | b
     }
 
+    #[inline(always)]
     fn loadu(src: &[i32]) -> i32 {
         src[0]
     }
 
+    #[inline(always)]
     fn storeu(v: i32, dst: &mut [i32]) {
         dst[0] = v;
     }
 
+    #[inline(always)]
+    fn store_widened_i32(v: i32, dst: &mut [i32]) {
+        dst[0] = v;
+    }
+
     /// See [`ScalarSimdI16::slli`]: the same one-lane degenerate NEG_INF fill.
+    #[inline(always)]
     fn slli<const N: i32>(_v: i32) -> i32 {
         Self::NEG_INF
     }
 
     /// See [`ScalarSimdI16::slli`]: the same one-lane degenerate NEG_INF fill, for the right
     /// shift.
+    #[inline(always)]
     fn srli<const N: i32>(_v: i32) -> i32 {
         Self::NEG_INF
     }
 
     /// See [`ScalarSimdI16::slli_one_lane`]: the same one-lane degenerate NEG_INF fill.
+    #[inline(always)]
     fn slli_one_lane(_v: i32) -> i32 {
         Self::NEG_INF
     }
 
     /// See [`ScalarSimdI16::srli_top_lane`]: the same one-lane degenerate NEG_INF fill.
+    #[inline(always)]
     fn srli_top_lane(_v: i32) -> i32 {
         Self::NEG_INF
     }
 
+    #[inline(always)]
     fn horizontal_max(v: i32) -> i32 {
         0i32.max(v)
     }
 
     /// Identity: see [`ScalarSimdI16::prefix_max`].
+    #[inline(always)]
     fn prefix_max(v: i32, _penalties: &[i32], _masks: &[i32]) -> i32 {
         v
     }

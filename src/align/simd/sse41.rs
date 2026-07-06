@@ -22,9 +22,9 @@
 
 use super::lanes::Simd;
 use core::arch::x86_64::{
-    __m128i, _mm_add_epi16, _mm_add_epi32, _mm_loadu_si128, _mm_max_epi16, _mm_max_epi32,
-    _mm_min_epi16, _mm_min_epi32, _mm_or_si128, _mm_set1_epi16, _mm_set1_epi32, _mm_slli_si128,
-    _mm_srli_si128, _mm_storeu_si128, _mm_sub_epi16, _mm_sub_epi32,
+    __m128i, _mm_add_epi16, _mm_add_epi32, _mm_cvtepi16_epi32, _mm_loadu_si128, _mm_max_epi16,
+    _mm_max_epi32, _mm_min_epi16, _mm_min_epi32, _mm_or_si128, _mm_set1_epi16, _mm_set1_epi32,
+    _mm_slli_si128, _mm_srli_si128, _mm_storeu_si128, _mm_sub_epi16, _mm_sub_epi32,
 };
 
 /// `i16::MIN + 1024`, this backend's `kNegativeInfinity` (see [`Simd::NEG_INF`]).
@@ -43,6 +43,7 @@ const NEG_INF_I32: i32 = i32::MIN + 1024;
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn or_si(a: __m128i, b: __m128i) -> __m128i {
     _mm_or_si128(a, b)
 }
@@ -52,6 +53,7 @@ unsafe fn or_si(a: __m128i, b: __m128i) -> __m128i {
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn slli_si<const N: i32>(v: __m128i) -> __m128i {
     _mm_slli_si128::<N>(v)
 }
@@ -61,6 +63,7 @@ unsafe fn slli_si<const N: i32>(v: __m128i) -> __m128i {
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn srli_si<const N: i32>(v: __m128i) -> __m128i {
     _mm_srli_si128::<N>(v)
 }
@@ -71,6 +74,7 @@ unsafe fn srli_si<const N: i32>(v: __m128i) -> __m128i {
 /// # Safety
 /// Caller must guarantee SSE4.1 is available AND that `src` points to at least 16 readable bytes.
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn loadu(src: *const u8) -> __m128i {
     _mm_loadu_si128(src.cast::<__m128i>())
 }
@@ -81,8 +85,25 @@ unsafe fn loadu(src: *const u8) -> __m128i {
 /// # Safety
 /// Caller must guarantee SSE4.1 is available AND that `dst` points to at least 16 writable bytes.
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn storeu(dst: *mut u8, v: __m128i) {
     _mm_storeu_si128(dst.cast::<__m128i>(), v);
+}
+
+/// Sign-extends the 8 packed `i16` lanes of `v` to `i32` and stores them contiguously to the 8
+/// `i32` slots at `dst` (32 bytes). Widens each 128-bit half with `_mm_cvtepi16_epi32` (low 4 lanes
+/// directly, high 4 after a byte-shift-right of 8) and stores the two resulting 4×`i32` vectors.
+///
+/// # Safety
+/// Caller must guarantee SSE4.1 is available AND that `dst` points to at least 8 writable `i32`
+/// (32 bytes).
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn store_widen_i16(dst: *mut i32, v: __m128i) {
+    let lo = _mm_cvtepi16_epi32(v);
+    let hi = _mm_cvtepi16_epi32(_mm_srli_si128::<8>(v));
+    _mm_storeu_si128(dst.cast::<__m128i>(), lo);
+    _mm_storeu_si128(dst.add(4).cast::<__m128i>(), hi);
 }
 
 // ---- Sse41I16: 8 × i16 -----------------------------------------------------------------------
@@ -96,6 +117,7 @@ pub(crate) struct Sse41I16;
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn add16(a: __m128i, b: __m128i) -> __m128i {
     _mm_add_epi16(a, b)
 }
@@ -105,6 +127,7 @@ unsafe fn add16(a: __m128i, b: __m128i) -> __m128i {
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn sub16(a: __m128i, b: __m128i) -> __m128i {
     _mm_sub_epi16(a, b)
 }
@@ -113,7 +136,11 @@ unsafe fn sub16(a: __m128i, b: __m128i) -> __m128i {
 ///
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
+// The `min` trait op is test-only: the DP fill maximizes score (so it uses `max`, never `min`),
+// so this faithful-port helper is dead in non-test builds.
+#[allow(dead_code)]
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn min16(a: __m128i, b: __m128i) -> __m128i {
     _mm_min_epi16(a, b)
 }
@@ -123,6 +150,7 @@ unsafe fn min16(a: __m128i, b: __m128i) -> __m128i {
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn max16(a: __m128i, b: __m128i) -> __m128i {
     _mm_max_epi16(a, b)
 }
@@ -132,6 +160,7 @@ unsafe fn max16(a: __m128i, b: __m128i) -> __m128i {
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn set1_16(value: i16) -> __m128i {
     _mm_set1_epi16(value)
 }
@@ -146,36 +175,43 @@ impl Simd for Sse41I16 {
     const RSS: i32 = 16 - size_of::<i16>() as i32; // 14
     const NEG_INF: i16 = NEG_INF_I16;
 
+    #[inline(always)]
     fn splat(value: i16) -> __m128i {
         // SAFETY: only reached after `is_x86_feature_detected!("sse4.1")` (see module Safety note).
         unsafe { set1_16(value) }
     }
 
+    #[inline(always)]
     fn add(a: __m128i, b: __m128i) -> __m128i {
         // SAFETY: see `splat`. Non-saturating `_mm_add_epi16` per the plan's Global Constraints.
         unsafe { add16(a, b) }
     }
 
+    #[inline(always)]
     fn sub(a: __m128i, b: __m128i) -> __m128i {
         // SAFETY: see `splat`. Non-saturating `_mm_sub_epi16`.
         unsafe { sub16(a, b) }
     }
 
+    #[inline(always)]
     fn min(a: __m128i, b: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { min16(a, b) }
     }
 
+    #[inline(always)]
     fn max(a: __m128i, b: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { max16(a, b) }
     }
 
+    #[inline(always)]
     fn or(a: __m128i, b: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { or_si(a, b) }
     }
 
+    #[inline(always)]
     fn loadu(src: &[i16]) -> __m128i {
         debug_assert!(src.len() >= Self::LANES);
         // SAFETY: see `splat`; the `debug_assert` above (and the trait's documented precondition)
@@ -183,34 +219,47 @@ impl Simd for Sse41I16 {
         unsafe { loadu(src.as_ptr().cast::<u8>()) }
     }
 
+    #[inline(always)]
     fn storeu(v: __m128i, dst: &mut [i16]) {
         debug_assert!(dst.len() >= Self::LANES);
         // SAFETY: see `loadu`, mirrored for the 16-byte write.
         unsafe { storeu(dst.as_mut_ptr().cast::<u8>(), v) }
     }
 
+    #[inline(always)]
+    fn store_widened_i32(v: __m128i, dst: &mut [i32]) {
+        debug_assert!(dst.len() >= Self::LANES);
+        // SAFETY: see `splat`; the `debug_assert` guarantees `dst` covers the 8 `i32` written.
+        unsafe { store_widen_i16(dst.as_mut_ptr(), v) }
+    }
+
+    #[inline(always)]
     fn slli<const N: i32>(v: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { slli_si::<N>(v) }
     }
 
+    #[inline(always)]
     fn srli<const N: i32>(v: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { srli_si::<N>(v) }
     }
 
     /// Diagonal shift by `LSS = 2` bytes (one `i16` lane), the literal for this width.
+    #[inline(always)]
     fn slli_one_lane(v: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { slli_si::<2>(v) }
     }
 
     /// Carry shift by `RSS = 14` bytes (isolate lane 7 into lane 0), the literal for this width.
+    #[inline(always)]
     fn srli_top_lane(v: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { srli_si::<14>(v) }
     }
 
+    #[inline(always)]
     fn horizontal_max(v: __m128i) -> i16 {
         let mut lanes = [0i16; 8];
         Self::storeu(v, &mut lanes);
@@ -220,6 +269,7 @@ impl Simd for Sse41I16 {
 
     /// Hand-unrolled 3-step ladder with byte-shifts `[2, 4, 8]` (`impl:182-184`). Each step is the
     /// shared [`Simd::prefix_max_step`] with that step's literal shift constant.
+    #[inline(always)]
     fn prefix_max(v: __m128i, penalties: &[__m128i], masks: &[__m128i]) -> __m128i {
         debug_assert!(penalties.len() >= Self::LOG_LANES as usize);
         debug_assert!(masks.len() >= Self::LOG_LANES as usize);
@@ -241,6 +291,7 @@ pub(crate) struct Sse41I32;
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn add32(a: __m128i, b: __m128i) -> __m128i {
     _mm_add_epi32(a, b)
 }
@@ -250,6 +301,7 @@ unsafe fn add32(a: __m128i, b: __m128i) -> __m128i {
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn sub32(a: __m128i, b: __m128i) -> __m128i {
     _mm_sub_epi32(a, b)
 }
@@ -258,7 +310,10 @@ unsafe fn sub32(a: __m128i, b: __m128i) -> __m128i {
 ///
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
+// Test-only trait op; see the note on `min16` above.
+#[allow(dead_code)]
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn min32(a: __m128i, b: __m128i) -> __m128i {
     _mm_min_epi32(a, b)
 }
@@ -268,6 +323,7 @@ unsafe fn min32(a: __m128i, b: __m128i) -> __m128i {
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn max32(a: __m128i, b: __m128i) -> __m128i {
     _mm_max_epi32(a, b)
 }
@@ -277,6 +333,7 @@ unsafe fn max32(a: __m128i, b: __m128i) -> __m128i {
 /// # Safety
 /// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
 #[target_feature(enable = "sse4.1")]
+#[inline]
 unsafe fn set1_32(value: i32) -> __m128i {
     _mm_set1_epi32(value)
 }
@@ -291,36 +348,43 @@ impl Simd for Sse41I32 {
     const RSS: i32 = 16 - size_of::<i32>() as i32; // 12
     const NEG_INF: i32 = NEG_INF_I32;
 
+    #[inline(always)]
     fn splat(value: i32) -> __m128i {
         // SAFETY: only reached after `is_x86_feature_detected!("sse4.1")` (see module Safety note).
         unsafe { set1_32(value) }
     }
 
+    #[inline(always)]
     fn add(a: __m128i, b: __m128i) -> __m128i {
         // SAFETY: see `splat`. Non-saturating `_mm_add_epi32` per the plan's Global Constraints.
         unsafe { add32(a, b) }
     }
 
+    #[inline(always)]
     fn sub(a: __m128i, b: __m128i) -> __m128i {
         // SAFETY: see `splat`. Non-saturating `_mm_sub_epi32`.
         unsafe { sub32(a, b) }
     }
 
+    #[inline(always)]
     fn min(a: __m128i, b: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { min32(a, b) }
     }
 
+    #[inline(always)]
     fn max(a: __m128i, b: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { max32(a, b) }
     }
 
+    #[inline(always)]
     fn or(a: __m128i, b: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { or_si(a, b) }
     }
 
+    #[inline(always)]
     fn loadu(src: &[i32]) -> __m128i {
         debug_assert!(src.len() >= Self::LANES);
         // SAFETY: see `splat`; the `debug_assert` (and the trait's documented precondition)
@@ -328,34 +392,48 @@ impl Simd for Sse41I32 {
         unsafe { loadu(src.as_ptr().cast::<u8>()) }
     }
 
+    #[inline(always)]
     fn storeu(v: __m128i, dst: &mut [i32]) {
         debug_assert!(dst.len() >= Self::LANES);
         // SAFETY: see `loadu`, mirrored for the 16-byte write.
         unsafe { storeu(dst.as_mut_ptr().cast::<u8>(), v) }
     }
 
+    #[inline(always)]
+    fn store_widened_i32(v: __m128i, dst: &mut [i32]) {
+        debug_assert!(dst.len() >= Self::LANES);
+        // Elem is already `i32`; the "widen" is a plain 16-byte store.
+        // SAFETY: see `loadu`, mirrored for the 16-byte write.
+        unsafe { storeu(dst.as_mut_ptr().cast::<u8>(), v) }
+    }
+
+    #[inline(always)]
     fn slli<const N: i32>(v: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { slli_si::<N>(v) }
     }
 
+    #[inline(always)]
     fn srli<const N: i32>(v: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { srli_si::<N>(v) }
     }
 
     /// Diagonal shift by `LSS = 4` bytes (one `i32` lane), the literal for this width.
+    #[inline(always)]
     fn slli_one_lane(v: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { slli_si::<4>(v) }
     }
 
     /// Carry shift by `RSS = 12` bytes (isolate lane 3 into lane 0), the literal for this width.
+    #[inline(always)]
     fn srli_top_lane(v: __m128i) -> __m128i {
         // SAFETY: see `splat`.
         unsafe { srli_si::<12>(v) }
     }
 
+    #[inline(always)]
     fn horizontal_max(v: __m128i) -> i32 {
         let mut lanes = [0i32; 4];
         Self::storeu(v, &mut lanes);
@@ -365,6 +443,7 @@ impl Simd for Sse41I32 {
 
     /// Hand-unrolled 2-step ladder with byte-shifts `[4, 8]` (`impl:217-218`). Each step is the
     /// shared [`Simd::prefix_max_step`] with that step's literal shift constant.
+    #[inline(always)]
     fn prefix_max(v: __m128i, penalties: &[__m128i], masks: &[__m128i]) -> __m128i {
         debug_assert!(penalties.len() >= Self::LOG_LANES as usize);
         debug_assert!(masks.len() >= Self::LOG_LANES as usize);
@@ -521,6 +600,31 @@ mod tests {
         let v = Sse41I16::loadu(&src);
         let mut dst = [0i16; 8];
         Sse41I16::storeu(v, &mut dst);
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn i16_store_widened_i32_sign_extends_all_lanes() {
+        if !is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+        let src = [-5i16, 2, -9, 11, i16::MIN, i16::MAX, 0, -1];
+        let v = Sse41I16::loadu(&src);
+        let mut dst = [0i32; 8];
+        Sse41I16::store_widened_i32(v, &mut dst);
+        let expected: [i32; 8] = std::array::from_fn(|k| i32::from(src[k]));
+        assert_eq!(dst, expected);
+    }
+
+    #[test]
+    fn i32_store_widened_i32_is_a_plain_store() {
+        if !is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+        let src = [-5i32, 123_456, i32::MIN, i32::MAX];
+        let v = Sse41I32::loadu(&src);
+        let mut dst = [0i32; 4];
+        Sse41I32::store_widened_i32(v, &mut dst);
         assert_eq!(dst, src);
     }
 

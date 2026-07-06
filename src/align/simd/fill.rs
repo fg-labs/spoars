@@ -1,11 +1,11 @@
 //! The generic, vectorized DP fills the SIMD engine runs before destriping into the shared scalar
-//! backtrack. This module holds the **linear-gap** fill; affine/convex land in later SIMD kernels
-//! plan tasks.
+//! backtrack. This module holds all three gap-mode fills — [`fill_linear`], [`fill_affine`], and
+//! [`fill_convex`].
 //!
 //! Ports `spoa::SimdAlignmentEngine<A>::Linear`'s FILL half
 //! (`third_party/spoa/src/simd_alignment_engine_implementation.hpp:727-898`) as a single function
-//! generic over the [`Simd`] trait, so one implementation serves every ISA backend (SSE4.1 now;
-//! NEON/AVX2 in later tasks). The recurrence computed per DP cell is identical to the scalar
+//! generic over the [`Simd`] trait, so one implementation serves every ISA backend (SSE4.1 and AVX2
+//! on x86_64, NEON on aarch64). The recurrence computed per DP cell is identical to the scalar
 //! [`crate::align::sisd::SisdEngine::linear`] fill (`sisd_alignment_engine.cpp:295-363`) — this is
 //! just its lane-parallel, striped form:
 //!
@@ -40,6 +40,7 @@ use crate::graph::{EdgeId, Graph};
 
 /// Extracts lane `lane` of `v`, widened to `i32`. Ports `_mmxxx_value_at` (`impl:253-258`):
 /// store-then-index, used for the NW per-row score at the last query column.
+#[inline]
 fn value_at<S>(v: S::Vec, lane: usize) -> i32
 where
     S: Simd,
@@ -64,6 +65,7 @@ where
 /// instead of [`Simd::horizontal_max`]. Padding lanes are always [`Simd::NEG_INF`], far below any
 /// in-range real DP value (the [`super::super::Escalation`] guard guarantees this), so folding them
 /// in via a plain (non-floored) max is safe.
+#[inline]
 fn row_max<S>(v: S::Vec) -> i32
 where
     S: Simd,
@@ -81,6 +83,7 @@ where
 /// lane equals `value`, or `-1` if none. Ports `_mmxxx_index_of` (`impl:261-289`) — the SW/OV
 /// `max_j` resolver. Trailing padding lanes always sit at flat indices `>= seq_len`, strictly above
 /// every real position, so a real cell achieving `value` is always found first.
+#[inline]
 fn index_of<S>(row: &[S::Vec], row_width: usize, value: i32) -> i32
 where
     S: Simd,
@@ -110,6 +113,7 @@ where
 /// (finite gap costs, well within the int16 range under the [`super::super::Escalation`] guard)
 /// cast losslessly. The linear fill's H boundary never reaches the sentinel, which is why it never
 /// needed this guard.
+#[inline]
 fn seed_striped_row0<S>(
     striped: &mut [S::Vec],
     row_major: &[i32],
@@ -149,12 +153,8 @@ fn seed_striped_row0<S>(
 ///
 /// The caller guarantees `seq_len >= 1` and a non-empty `graph` (both short-circuited earlier in
 /// [`super::SimdEngine::align`]), so `matrix_width_vecs >= 1`.
-// Not yet called on non-x86_64 targets: only the SSE4.1 pipeline in `simd::mod` wires this in so
-// far (Tasks 7-8, all three alignment types); the NEON backend (a later SIMD kernels plan task) is
-// its aarch64 caller, at which point this `allow` is redundant there too. On x86_64 it is already
-// used (so the allow is a harmless no-op). See `SimdEngine`'s identical rationale in `simd/mod.rs`.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn fill_linear<S>(
     graph: &Graph,
     seq_len: usize,
@@ -164,7 +164,8 @@ pub(crate) fn fill_linear<S>(
     profile: &[S::Vec],
     masks: &[S::Vec],
     penalties: &[S::Vec],
-) -> (Vec<S::Vec>, usize, usize, i32)
+    striped_h: &mut Vec<S::Vec>,
+) -> (usize, usize, i32)
 where
     S: Simd,
     S::Elem: ElemFromI32 + ElemToI32,
@@ -187,8 +188,12 @@ where
         node_id_to_rank[tail.0 as usize] as usize + 1
     };
 
-    // Striped H, all rows seeded to neg-inf; row 0 then overwritten with the boundary row.
-    let mut striped_h = vec![S::splat(S::NEG_INF); matrix_height * matrix_width_vecs];
+    // Striped H, all rows seeded to neg-inf (reusing the caller's grow-only buffer — clear keeps
+    // the allocation, resize refills every used cell with neg-inf, so no stale value from a prior
+    // larger align survives); row 0 then overwritten with the boundary row.
+    let cells = matrix_height * matrix_width_vecs;
+    striped_h.clear();
+    striped_h.resize(cells, S::splat(S::NEG_INF));
     {
         let mut lane_buf = vec![S::Elem::from_i32(0); lanes];
         for (segment, slot) in striped_h.iter_mut().take(matrix_width_vecs).enumerate() {
@@ -303,7 +308,7 @@ where
 
     // Resolve max_j (impl:875-898). "Not found" -> (0, 0), the backtrack's empty-alignment guard.
     if max_i == 0 {
-        return (striped_h, 0, 0, max_score);
+        return (0, 0, max_score);
     }
     let max_j = match alignment_type {
         // NW: last query column. Scalar row-major column = normal_matrix_width = seq_len.
@@ -314,33 +319,23 @@ where
             let row = &striped_h[max_i * matrix_width_vecs..(max_i + 1) * matrix_width_vecs];
             let idx = index_of::<S>(row, matrix_width_vecs, max_score);
             if idx < 0 {
-                return (striped_h, 0, 0, max_score);
+                return (0, 0, max_score);
             }
             idx as usize + 1
         }
     };
 
-    (striped_h, max_i, max_j, max_score)
+    (max_i, max_j, max_score)
 }
-
-/// The affine fill's result: the striped `H`, `E` and `F` matrices, then the `(max_i, max_j,
-/// max_score)` start cell for the shared scalar backtrack (see [`fill_affine`]).
-pub(crate) type AffineFill<S> = (
-    Vec<<S as Simd>::Vec>,
-    Vec<<S as Simd>::Vec>,
-    Vec<<S as Simd>::Vec>,
-    usize,
-    usize,
-    i32,
-);
 
 /// Runs the vectorized affine-gap DP fill for `seq` (length `seq_len`) against `graph`.
 ///
-/// Returns the striped `H`, `E` (horizontal-gap) and `F` (vertical-gap) matrices (each
-/// `matrix_height * matrix_width_vecs` vectors, **row 0 is the seeded boundary row** — H's and F's
-/// are read as predecessors of the first interior rows; E's row 0 is unused) together with the
-/// fill's `(max_i, max_j, max_score)` start cell for the shared scalar [`backtrack_affine`]. The
-/// coordinate/`(0, 0)` conventions match [`fill_linear`].
+/// Fills the caller-owned (grow-only, reused-across-calls) striped `H`, `E` (horizontal-gap) and
+/// `F` (vertical-gap) matrix buffers (each grown to `matrix_height * matrix_width_vecs` vectors and
+/// fully reset to neg-inf, **row 0 then overwritten with the boundary row** — H's and F's are read
+/// as predecessors of the first interior rows; E's row 0 is unused) and returns the fill's `(max_i,
+/// max_j, max_score)` start cell for the shared scalar [`backtrack_affine`]. The coordinate/`(0, 0)`
+/// conventions match [`fill_linear`].
 ///
 /// Ports `spoa::SimdAlignmentEngine<A>::Affine`'s FILL half
 /// (`third_party/spoa/src/simd_alignment_engine_implementation.hpp:1119-1239`) — the lane-parallel,
@@ -361,9 +356,8 @@ pub(crate) type AffineFill<S> = (
 /// - **H = max(H, F, E)** then per-type max tracking (`impl:1191,1203,1208-1238`): NW takes the
 ///   last query column's value at each sink node; SW/OV reduce rows (OV via the unclamped
 ///   [`row_max`], see its doc — mirrored from [`fill_linear`] so Task 9b's SW/OV branch is correct).
-// See `fill_linear`'s identical `#[allow(dead_code)]` rationale.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn fill_affine<S>(
     graph: &Graph,
     seq_len: usize,
@@ -373,7 +367,10 @@ pub(crate) fn fill_affine<S>(
     profile: &[S::Vec],
     masks: &[S::Vec],
     penalties: &[S::Vec],
-) -> AffineFill<S>
+    striped_h: &mut Vec<S::Vec>,
+    striped_e: &mut Vec<S::Vec>,
+    striped_f: &mut Vec<S::Vec>,
+) -> (usize, usize, i32)
 where
     S: Simd,
     S::Elem: ElemFromI32 + ElemToI32,
@@ -398,13 +395,17 @@ where
         node_id_to_rank[tail.0 as usize] as usize + 1
     };
 
-    // Striped H/E/F, all rows neg-inf; H and F row 0 then overwritten with the boundary rows (read
-    // as predecessors of the first interior rows). E's row 0 is never read by the fill.
-    let mut striped_h = vec![S::splat(S::NEG_INF); matrix_height * matrix_width_vecs];
-    let mut striped_e = vec![S::splat(S::NEG_INF); matrix_height * matrix_width_vecs];
-    let mut striped_f = vec![S::splat(S::NEG_INF); matrix_height * matrix_width_vecs];
-    seed_striped_row0::<S>(&mut striped_h, &seeded.h, matrix_width_vecs, seq_len);
-    seed_striped_row0::<S>(&mut striped_f, &seeded.f, matrix_width_vecs, seq_len);
+    // Striped H/E/F, all rows reset to neg-inf (reusing the caller's grow-only buffers — clear
+    // keeps the allocation, resize refills every used cell, so no stale value from a prior larger
+    // align survives); H and F row 0 then overwritten with the boundary rows (read as predecessors
+    // of the first interior rows). E's row 0 is never read by the fill.
+    let cells = matrix_height * matrix_width_vecs;
+    for buf in [&mut *striped_h, &mut *striped_e, &mut *striped_f] {
+        buf.clear();
+        buf.resize(cells, S::splat(S::NEG_INF));
+    }
+    seed_striped_row0::<S>(striped_h, &seeded.h, matrix_width_vecs, seq_len);
+    seed_striped_row0::<S>(striped_f, &seeded.f, matrix_width_vecs, seq_len);
 
     let mut max_score: i32 = match alignment_type {
         AlignmentType::Local => 0,
@@ -514,7 +515,7 @@ where
 
     // Resolve max_j (impl:1241-1262). "Not found" -> (0, 0), the backtrack's empty-alignment guard.
     if max_i == 0 {
-        return (striped_h, striped_e, striped_f, 0, 0, max_score);
+        return (0, 0, max_score);
     }
     let max_j = match alignment_type {
         AlignmentType::Global => seq_len,
@@ -522,36 +523,24 @@ where
             let row = &striped_h[max_i * matrix_width_vecs..(max_i + 1) * matrix_width_vecs];
             let idx = index_of::<S>(row, matrix_width_vecs, max_score);
             if idx < 0 {
-                return (striped_h, striped_e, striped_f, 0, 0, max_score);
+                return (0, 0, max_score);
             }
             idx as usize + 1
         }
     };
 
-    (striped_h, striped_e, striped_f, max_i, max_j, max_score)
+    (max_i, max_j, max_score)
 }
-
-/// The convex fill's result: the striped `H`, `E`, `F`, `O` and `Q` matrices, then the `(max_i,
-/// max_j, max_score)` start cell for the shared scalar backtrack (see [`fill_convex`]).
-pub(crate) type ConvexFill<S> = (
-    Vec<<S as Simd>::Vec>,
-    Vec<<S as Simd>::Vec>,
-    Vec<<S as Simd>::Vec>,
-    Vec<<S as Simd>::Vec>,
-    Vec<<S as Simd>::Vec>,
-    usize,
-    usize,
-    i32,
-);
 
 /// Runs the vectorized convex-gap DP fill for `seq` (length `seq_len`) against `graph`.
 ///
-/// Returns the striped `H`, `E`, `F`, `O` and `Q` matrices (each `matrix_height *
-/// matrix_width_vecs` vectors, **row 0 is the seeded boundary row** for H/F/O — read as
-/// predecessors of the first interior rows; E's and Q's row 0 are unused, exactly as the scalar
-/// convex fill never reads a horizontal-gap matrix's row 0) together with the fill's `(max_i,
-/// max_j, max_score)` start cell for the shared scalar [`backtrack_convex`]. The coordinate/`(0, 0)`
-/// conventions match [`fill_linear`].
+/// Fills the caller-owned (grow-only, reused-across-calls) striped `H`, `E`, `F`, `O` and `Q`
+/// matrix buffers (each grown to `matrix_height * matrix_width_vecs` vectors and fully reset to
+/// neg-inf, **row 0 then overwritten with the boundary row** for H/F/O — read as predecessors of
+/// the first interior rows; E's and Q's row 0 are unused, exactly as the scalar convex fill never
+/// reads a horizontal-gap matrix's row 0) and returns the fill's `(max_i, max_j, max_score)` start
+/// cell for the shared scalar [`backtrack_convex`]. The coordinate/`(0, 0)` conventions match
+/// [`fill_linear`].
 ///
 /// Ports `spoa::SimdAlignmentEngine<A>::Convex`'s FILL half
 /// (`third_party/spoa/src/simd_alignment_engine_implementation.hpp:1573-1736`) — the lane-parallel,
@@ -578,9 +567,8 @@ pub(crate) type ConvexFill<S> = (
 ///   column's value at each sink node; SW/OV reduce rows (OV via the unclamped [`row_max`], see its
 ///   doc). All three types are wired: Global/NW (Task 10a) and Local/SW + Overlap/OV (Task 10b) —
 ///   this completes the full SSE4.1 int16 engine (all 9 gap-mode x alignment-type combinations).
-// See `fill_linear`'s identical `#[allow(dead_code)]` rationale.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn fill_convex<S>(
     graph: &Graph,
     seq_len: usize,
@@ -591,7 +579,12 @@ pub(crate) fn fill_convex<S>(
     masks: &[S::Vec],
     penalties_e: &[S::Vec],
     penalties_c: &[S::Vec],
-) -> ConvexFill<S>
+    striped_h: &mut Vec<S::Vec>,
+    striped_e: &mut Vec<S::Vec>,
+    striped_f: &mut Vec<S::Vec>,
+    striped_o: &mut Vec<S::Vec>,
+    striped_q: &mut Vec<S::Vec>,
+) -> (usize, usize, i32)
 where
     S: Simd,
     S::Elem: ElemFromI32 + ElemToI32,
@@ -625,14 +618,20 @@ where
     // (read as predecessors of the first interior rows). E's and Q's row 0 are never read by the
     // fill (horizontal-gap matrices have no diagonal/vertical predecessor term), matching how the
     // scalar convex fill never reads e/q row 0.
-    let mut striped_h = vec![S::splat(S::NEG_INF); matrix_height * matrix_width_vecs];
-    let mut striped_e = vec![S::splat(S::NEG_INF); matrix_height * matrix_width_vecs];
-    let mut striped_f = vec![S::splat(S::NEG_INF); matrix_height * matrix_width_vecs];
-    let mut striped_o = vec![S::splat(S::NEG_INF); matrix_height * matrix_width_vecs];
-    let mut striped_q = vec![S::splat(S::NEG_INF); matrix_height * matrix_width_vecs];
-    seed_striped_row0::<S>(&mut striped_h, &seeded.h, matrix_width_vecs, seq_len);
-    seed_striped_row0::<S>(&mut striped_f, &seeded.f, matrix_width_vecs, seq_len);
-    seed_striped_row0::<S>(&mut striped_o, &seeded.o, matrix_width_vecs, seq_len);
+    let cells = matrix_height * matrix_width_vecs;
+    for buf in [
+        &mut *striped_h,
+        &mut *striped_e,
+        &mut *striped_f,
+        &mut *striped_o,
+        &mut *striped_q,
+    ] {
+        buf.clear();
+        buf.resize(cells, S::splat(S::NEG_INF));
+    }
+    seed_striped_row0::<S>(striped_h, &seeded.h, matrix_width_vecs, seq_len);
+    seed_striped_row0::<S>(striped_f, &seeded.f, matrix_width_vecs, seq_len);
+    seed_striped_row0::<S>(striped_o, &seeded.o, matrix_width_vecs, seq_len);
 
     let mut max_score: i32 = match alignment_type {
         AlignmentType::Local => 0,
@@ -760,9 +759,7 @@ where
 
     // Resolve max_j (impl:1738-1760). "Not found" -> (0, 0), the backtrack's empty-alignment guard.
     if max_i == 0 {
-        return (
-            striped_h, striped_e, striped_f, striped_o, striped_q, 0, 0, max_score,
-        );
+        return (0, 0, max_score);
     }
     let max_j = match alignment_type {
         AlignmentType::Global => seq_len,
@@ -770,15 +767,11 @@ where
             let row = &striped_h[max_i * matrix_width_vecs..(max_i + 1) * matrix_width_vecs];
             let idx = index_of::<S>(row, matrix_width_vecs, max_score);
             if idx < 0 {
-                return (
-                    striped_h, striped_e, striped_f, striped_o, striped_q, 0, 0, max_score,
-                );
+                return (0, 0, max_score);
             }
             idx as usize + 1
         }
     };
 
-    (
-        striped_h, striped_e, striped_f, striped_o, striped_q, max_i, max_j, max_score,
-    )
+    (max_i, max_j, max_score)
 }

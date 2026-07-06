@@ -1,17 +1,18 @@
 //! SIMD-accelerated alignment engine.
 //!
-//! This module will eventually hold hand-tuned, per-ISA (SSE4.1 / NEON / AVX2) vectorized DP-fill
-//! kernels for [`crate::align::AlignmentEngine`], dispatched at runtime and validated bit-for-bit
-//! against the scalar [`crate::align::SisdEngine`] (which is their in-process oracle — see the
-//! SIMD kernels plan's Global Constraints). For now [`SimdEngine`] delegates `align` entirely to
-//! an internal `SisdEngine`, so it is correct (if not yet fast) from this first commit; later
-//! tasks replace the delegation with real vectorized kernels one gap-mode/ISA at a time.
+//! This module holds hand-tuned, per-ISA vectorized DP-fill kernels for
+//! [`crate::align::AlignmentEngine`], dispatched at runtime: SSE4.1 and AVX2 on x86_64, NEON on
+//! aarch64, each at the int16 and int32 tiers, with a scalar fallback. Every kernel is validated
+//! bit-for-bit against the scalar [`crate::align::SisdEngine`] (its in-process oracle — see the
+//! SIMD kernels plan's Global Constraints); [`SimdEngine`] returns exactly what `SisdEngine` would,
+//! only faster. The kernels vectorize the DP fill and reuse the scalar backtrack, so the
+//! accelerated path can never change the result.
 //!
-//! `unsafe` is confined to this module (and its submodules, once they exist): the crate root uses
+//! `unsafe` is confined to this module and its submodules: the crate root uses
 //! `#![deny(unsafe_code)]` rather than `#![forbid(...)]` specifically so that this module can
 //! reopen it with `#![allow(unsafe_code)]` below (a crate-level `forbid` cannot be relaxed by an
-//! inner `allow` — rustc E0453). No `unsafe` is used yet; the allow is here in advance for the
-//! hand-written intrinsics later tasks add.
+//! inner `allow` — rustc E0453). The `unsafe` here is exactly the per-ISA intrinsic calls, each
+//! reached only after the matching runtime feature detection (see the module Safety note below).
 
 #![allow(unsafe_code)]
 
@@ -25,8 +26,107 @@ mod profile;
 #[cfg(target_arch = "x86_64")]
 mod sse41;
 
+use crate::align::sisd::ScalarInit;
 use crate::align::{Alignment, AlignmentEngine, AlignmentType, Scoring, SisdEngine};
 use crate::graph::Graph;
+
+/// The reused-across-`align`-calls **striped** SIMD scratch for one concrete register type `V`
+/// (`__m128i`/`__m256i`/`int16x8_t`/`int32x4_t`): the striped char profile, the up-to-five striped
+/// DP matrices, and the prefix-max ladder's masks/penalties. Every buffer is grow-only (only ever
+/// resized *up*, never shrunk or reallocated smaller — mirroring [`crate::align::sisd`]'s own
+/// `Realloc`); a smaller later alignment simply computes its offsets from its own dimensions into a
+/// possibly-oversized buffer, and each fill fully re-writes (or `clear`+`resize`-refills) every cell
+/// it later reads, so no stale value from a prior (larger) call is ever observed. This is the P2
+/// "striped-buffer reuse" that removes the per-`align` allocation of these buffers, with zero change
+/// to output.
+///
+/// The masks/penalties depend ONLY on the (fixed) scoring and the element width, so they are cached
+/// (built once and reused) rather than rebuilt per call; [`StripedBuffers::cached_elem_width`]
+/// records which element width they were built for, so a same-engine escalation switch (e.g. int16
+/// → int32, which shares this same register type on x86) transparently rebuilds them exactly once
+/// on the width change. The DP matrices/profile share one register type across widths and are fully
+/// refilled per call, so no width tracking is needed for them.
+// Only instantiated on targets with a vectorized backend wired in.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+struct StripedBuffers<V> {
+    /// The striped char profile ([`profile::build_profile`]); rebuilt every call (depends on `seq`).
+    profile: Vec<V>,
+    /// Striped main DP matrix `H` (all gap modes).
+    h: Vec<V>,
+    /// Striped sequence-axis gap matrix `E` (affine/convex; unused for linear).
+    e: Vec<V>,
+    /// Striped graph-axis gap matrix `F` (affine/convex; unused for linear).
+    f: Vec<V>,
+    /// Striped second-affine-layer graph-axis gap matrix `O` (convex only).
+    o: Vec<V>,
+    /// Striped second-affine-layer sequence-axis gap matrix `Q` (convex only).
+    q: Vec<V>,
+    /// Cached prefix-max ladder masks ([`profile::build_masks`]).
+    masks: Vec<V>,
+    /// Cached prefix-max penalty ladder ([`profile::build_penalties`]): from `g` (linear), `e`
+    /// (affine), or the first extend `e` (convex).
+    penalties: Vec<V>,
+    /// Cached SECOND prefix-max penalty ladder (convex only): from the second extend `c`.
+    penalties_c: Vec<V>,
+    /// The element width (`size_of::<S::Elem>()`, i.e. 2 for `i16` / 4 for `i32`) the cached
+    /// `masks`/`penalties`/`penalties_c` were built for, or `0` when nothing has been cached yet.
+    /// Guards against reusing an int16-shaped ladder for an int32 alignment (and vice versa) when
+    /// both widths share one register type.
+    cached_elem_width: usize,
+}
+
+// Manual `Default` (not derived) so it applies for register types `V` that do NOT implement
+// `Default` (e.g. `__m128i`): every field is an empty `Vec`/zero, independent of `V`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl<V> Default for StripedBuffers<V> {
+    fn default() -> StripedBuffers<V> {
+        StripedBuffers {
+            profile: Vec::new(),
+            h: Vec::new(),
+            e: Vec::new(),
+            f: Vec::new(),
+            o: Vec::new(),
+            q: Vec::new(),
+            masks: Vec::new(),
+            penalties: Vec::new(),
+            penalties_c: Vec::new(),
+            cached_elem_width: 0,
+        }
+    }
+}
+
+/// The per-ISA striped scratch stored on [`SimdEngine`], one variant per concrete register type
+/// actually used on the host. [`SimdEngine`] is NOT generic over the lane backend `S` (it dispatches
+/// at runtime), and `S::Vec` differs by ISA/width — this enum is the clean, `unsafe`-free bridge:
+/// each variant owns a concretely-typed [`StripedBuffers`], and the dispatch site (where the
+/// concrete `S` is known) selects the matching variant.
+///
+/// On x86_64 one `Vec<__m128i>` serves BOTH SSE4.1 widths (`Sse41I16::Vec == Sse41I32::Vec ==
+/// __m128i`) and one `Vec<__m256i>` serves BOTH AVX2 widths, so a single variant per ISA suffices.
+/// On aarch64 `NeonI16::Vec == int16x8_t` and `NeonI32::Vec == int32x4_t` are genuinely distinct
+/// types, so NEON needs one variant per width. Because the host's ISA is fixed (a deterministic
+/// [`detect_isa`] per CPU), only ONE variant is ever live on a given host; the lazy initialization
+/// in the accessor methods below builds the matching one on first use.
+// On any single build host only the variants reachable through that host's `#[cfg(target_arch)]`
+// exist; `None` is the always-present initial state (set in `SimdEngine::new`).
+#[derive(Default)]
+enum StripedScratch {
+    /// x86_64 SSE4.1 (128-bit `__m128i`), shared by the int16 and int32 SSE4.1 kernels.
+    #[cfg(target_arch = "x86_64")]
+    Sse41(StripedBuffers<core::arch::x86_64::__m128i>),
+    /// x86_64 AVX2 (256-bit `__m256i`), shared by the int16 and int32 AVX2 kernels.
+    #[cfg(target_arch = "x86_64")]
+    Avx2(StripedBuffers<core::arch::x86_64::__m256i>),
+    /// aarch64 NEON int16 (`int16x8_t`).
+    #[cfg(target_arch = "aarch64")]
+    NeonI16(StripedBuffers<core::arch::aarch64::int16x8_t>),
+    /// aarch64 NEON int32 (`int32x4_t`).
+    #[cfg(target_arch = "aarch64")]
+    NeonI32(StripedBuffers<core::arch::aarch64::int32x4_t>),
+    /// No striped scratch allocated yet (the initial state), or no vectorized backend on this host.
+    #[default]
+    None,
+}
 
 /// Which int-width kernel a given `(scoring, seq_len, node_count)` triple must use, based on the
 /// worst-case DP-cell score that combination can reach.
@@ -104,16 +204,46 @@ enum Isa {
     None,
 }
 
+/// Environment variable that pins [`detect_isa`] to a lower-tier ISA than the CPU's best, honored
+/// **only as a downgrade** to an ISA the current CPU actually supports. It can never enable an ISA
+/// the hardware lacks, preserving the soundness invariant that a `#[target_feature]` `run_*` wrapper
+/// is reached only after its feature was detected. The only meaningful value is `sse41` (pins to
+/// SSE4.1 on an AVX2-capable x86 CPU); any other value is ignored and normal detection proceeds.
+///
+/// Intended for A/B profiling (AVX2 vs SSE4.1 on one host) and for exercising the SSE4.1 path under
+/// test on AVX2 hardware. It does not affect output — every ISA is bit-exact with [`SisdEngine`].
+// Only read inside the `#[cfg(target_arch = "x86_64")]` arm of `detect_isa` (the sole ISA with a
+// meaningful downgrade); the `cfg_attr` keeps it compiled everywhere for the cross-target unit test
+// while allowing dead-code on architectures where the non-test build never references it.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+const FORCE_ISA_ENV: &str = "SPOARS_FORCE_ISA";
+
+/// Whether [`FORCE_ISA_ENV`]'s raw value (`None` when the variable is unset) requests suppressing
+/// AVX2 in favor of SSE4.1. Case-insensitive match on `sse41`; every other value (including unset,
+/// empty, or an unrecognized ISA name) is `false`, i.e. leaves normal detection in place. Factored
+/// out as a pure function so the decision is unit-testable without an AVX2 CPU (the surrounding
+/// `is_x86_feature_detected!` gate is not).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn should_force_sse41(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| raw.eq_ignore_ascii_case("sse41"))
+}
+
 /// Detects the best available vectorized [`Isa`] on the current CPU at runtime.
 ///
 /// `is_x86_feature_detected!`/`is_aarch64_feature_detected!` are only defined by `std` on their
 /// respective architectures, so each branch is behind a matching `#[cfg(target_arch = ...)]` —
 /// this keeps the function compiling (and returning [`Isa::None`]) on every other target rather
 /// than failing to compile at all.
+///
+/// Honors [`FORCE_ISA_ENV`] as a downgrade only (see its doc): `SPOARS_FORCE_ISA=sse41` pins to
+/// SSE4.1 on an AVX2 CPU, which is why the AVX2 arm additionally checks it is not being suppressed.
 fn detect_isa() -> Isa {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        // Downgrade hook: only "sse41" is meaningful (suppress AVX2 in favor of SSE4.1). Reading it
+        // here (once per `align`, not per DP cell) keeps it out of the vectorized hot loop.
+        let force_sse41 = should_force_sse41(std::env::var(FORCE_ISA_ENV).ok().as_deref());
+        if is_x86_feature_detected!("avx2") && !force_sse41 {
             return Isa::Avx2;
         }
         if is_x86_feature_detected!("sse4.1") {
@@ -167,6 +297,29 @@ pub struct SimdEngine {
     /// `inner`'s private state.
     scoring: Scoring,
     inner: SisdEngine,
+    /// Grow-only, reused-across-calls row-major DP scratch (boundary buffers, `sequence_profile`,
+    /// `node_id_to_rank`) — the SIMD analog of [`SisdEngine`]'s own buffer fields (P2, first pass).
+    /// Every vectorized `align` re-seeds this in place via
+    /// [`crate::align::sisd::reseed_scalar_buffers`] instead of allocating (and zeroing) fresh
+    /// `Vec`s, which is the largest per-`align` allocation the SIMD path was making.
+    // Unused on targets without a vectorized backend wired in (same rationale as the fields above).
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    scratch: ScalarInit,
+    /// Grow-only, reused-across-calls **striped** SIMD scratch (the ISA-register-typed profile, DP
+    /// matrices, and cached masks/penalties) — the deferred second half of P2. Held as a per-ISA
+    /// [`StripedScratch`] enum (one variant per concrete register type) rather than as `S`-generic
+    /// fields, since [`SimdEngine`] dispatches to a concrete backend at runtime and is not itself
+    /// generic over `S`. Lazily initialized to the matching variant on first `align` of that
+    /// (ISA, width); see [`StripedBuffers`] for the grow-only/zero-output-change invariant.
+    // Unused on targets without a vectorized backend wired in (same rationale as `scratch`).
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    striped: StripedScratch,
 }
 
 impl SimdEngine {
@@ -177,7 +330,88 @@ impl SimdEngine {
             alignment_type,
             scoring,
             inner: SisdEngine::new(alignment_type, scoring),
+            scratch: ScalarInit::default(),
+            striped: StripedScratch::None,
         }
+    }
+
+    /// Returns disjoint `&mut` handles to the row-major scratch and the SSE4.1 striped buffers
+    /// (`Vec<__m128i>`, shared by the int16 and int32 SSE4.1 kernels), lazily switching
+    /// [`SimdEngine::striped`] to the [`StripedScratch::Sse41`] variant on first use. Splitting the
+    /// borrow here (both are disjoint fields of `self`) lets the generic `align_simd_*` pipeline
+    /// take both without aliasing.
+    #[cfg(target_arch = "x86_64")]
+    fn sse41_scratch(
+        &mut self,
+    ) -> (
+        &mut ScalarInit,
+        &mut StripedBuffers<core::arch::x86_64::__m128i>,
+    ) {
+        if !matches!(self.striped, StripedScratch::Sse41(_)) {
+            self.striped = StripedScratch::Sse41(StripedBuffers::default());
+        }
+        let striped = match &mut self.striped {
+            StripedScratch::Sse41(buffers) => buffers,
+            _ => unreachable!("just ensured the Sse41 variant"),
+        };
+        (&mut self.scratch, striped)
+    }
+
+    /// AVX2 counterpart of [`SimdEngine::sse41_scratch`] (`Vec<__m256i>`, shared by the int16 and
+    /// int32 AVX2 kernels).
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_scratch(
+        &mut self,
+    ) -> (
+        &mut ScalarInit,
+        &mut StripedBuffers<core::arch::x86_64::__m256i>,
+    ) {
+        if !matches!(self.striped, StripedScratch::Avx2(_)) {
+            self.striped = StripedScratch::Avx2(StripedBuffers::default());
+        }
+        let striped = match &mut self.striped {
+            StripedScratch::Avx2(buffers) => buffers,
+            _ => unreachable!("just ensured the Avx2 variant"),
+        };
+        (&mut self.scratch, striped)
+    }
+
+    /// NEON int16 counterpart of [`SimdEngine::sse41_scratch`] (`Vec<int16x8_t>`). NEON's two widths
+    /// use genuinely distinct register types, so each gets its own variant (unlike x86's shared
+    /// register); switching width re-initializes to the other variant on next use.
+    #[cfg(target_arch = "aarch64")]
+    fn neon_i16_scratch(
+        &mut self,
+    ) -> (
+        &mut ScalarInit,
+        &mut StripedBuffers<core::arch::aarch64::int16x8_t>,
+    ) {
+        if !matches!(self.striped, StripedScratch::NeonI16(_)) {
+            self.striped = StripedScratch::NeonI16(StripedBuffers::default());
+        }
+        let striped = match &mut self.striped {
+            StripedScratch::NeonI16(buffers) => buffers,
+            _ => unreachable!("just ensured the NeonI16 variant"),
+        };
+        (&mut self.scratch, striped)
+    }
+
+    /// NEON int32 counterpart of [`SimdEngine::neon_i16_scratch`] (`Vec<int32x4_t>`).
+    #[cfg(target_arch = "aarch64")]
+    fn neon_i32_scratch(
+        &mut self,
+    ) -> (
+        &mut ScalarInit,
+        &mut StripedBuffers<core::arch::aarch64::int32x4_t>,
+    ) {
+        if !matches!(self.striped, StripedScratch::NeonI32(_)) {
+            self.striped = StripedScratch::NeonI32(StripedBuffers::default());
+        }
+        let striped = match &mut self.striped {
+            StripedScratch::NeonI32(buffers) => buffers,
+            _ => unreachable!("just ensured the NeonI32 variant"),
+        };
+        (&mut self.scratch, striped)
     }
 }
 
@@ -198,44 +432,52 @@ impl SimdEngine {
 /// [`Isa::Sse41`], `is_aarch64_feature_detected!("neon")` for [`Isa::Neon`]) selected an ISA whose
 /// `target_feature` code inside `S` is therefore sound (see each backend's module Safety note).
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
 fn align_simd_linear<S>(
     alignment_type: AlignmentType,
     scoring: Scoring,
     seq: &[u8],
     graph: &Graph,
+    seeded: &mut ScalarInit,
+    striped: &mut StripedBuffers<S::Vec>,
 ) -> (Alignment, i32)
 where
     S: lanes::Simd,
     S::Elem: profile::ElemFromI32 + profile::ElemToI32,
 {
     use crate::align::backtrack::backtrack_linear;
-    use profile::{
-        build_masks, build_penalties, build_profile, destripe_interior, seed_scalar_buffers,
-        ElemFromI32,
-    };
+    use crate::align::sisd::reseed_scalar_buffers;
+    use profile::{build_masks, build_penalties, build_profile, destripe_interior, ElemFromI32};
 
-    let mut seeded = seed_scalar_buffers(graph, seq, scoring, alignment_type);
-    let simd_profile = build_profile::<S>(graph, seq, scoring);
-    let masks = build_masks::<S>(S::NEG_INF);
-    let penalties = build_penalties::<S>(S::Elem::from_i32(i32::from(scoring.g)));
+    reseed_scalar_buffers(seeded, alignment_type, scoring, seq, graph);
+    build_profile::<S>(&mut striped.profile, graph, seq, scoring);
+    // Masks/penalties depend only on the (fixed) scoring and the element width, so build them once
+    // and reuse — rebuilding only if a same-engine escalation switched the element width.
+    let elem_width = core::mem::size_of::<S::Elem>();
+    if striped.cached_elem_width != elem_width {
+        striped.masks = build_masks::<S>(S::NEG_INF);
+        striped.penalties = build_penalties::<S>(S::Elem::from_i32(i32::from(scoring.g)));
+        striped.cached_elem_width = elem_width;
+    }
 
-    let (striped_h, max_i, max_j, max_score) = fill::fill_linear::<S>(
+    let (max_i, max_j, max_score) = fill::fill_linear::<S>(
         graph,
         seq.len(),
         scoring,
         alignment_type,
-        &seeded,
-        &simd_profile,
-        &masks,
-        &penalties,
+        seeded,
+        &striped.profile,
+        &striped.masks,
+        &striped.penalties,
+        &mut striped.h,
     );
 
-    // Destripe only the interior rows (rows 1..); row 0 of `striped_h` is the boundary already in
+    // Destripe only the interior rows (rows 1..); row 0 of `striped.h` is the boundary already in
     // `seeded.h`, which `destripe_interior` never touches.
     let matrix_width_vecs = seq.len().div_ceil(S::LANES);
     destripe_interior::<S>(
         &mut seeded.h,
-        &striped_h[matrix_width_vecs..],
+        &striped.h[matrix_width_vecs..],
         matrix_width_vecs,
         seq.len(),
     );
@@ -270,36 +512,45 @@ where
 /// Only reached after the caller's runtime ISA feature check selected an ISA whose `target_feature`
 /// code inside `S` is therefore sound (see [`align_simd_linear`]).
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
 fn align_simd_affine<S>(
     alignment_type: AlignmentType,
     scoring: Scoring,
     seq: &[u8],
     graph: &Graph,
+    seeded: &mut ScalarInit,
+    striped: &mut StripedBuffers<S::Vec>,
 ) -> (Alignment, i32)
 where
     S: lanes::Simd,
     S::Elem: profile::ElemFromI32 + profile::ElemToI32,
 {
     use crate::align::backtrack::backtrack_affine;
-    use profile::{
-        build_masks, build_penalties, build_profile, destripe_interior, seed_scalar_buffers,
-        ElemFromI32,
-    };
+    use crate::align::sisd::reseed_scalar_buffers;
+    use profile::{build_masks, build_penalties, build_profile, destripe_interior, ElemFromI32};
 
-    let mut seeded = seed_scalar_buffers(graph, seq, scoring, alignment_type);
-    let simd_profile = build_profile::<S>(graph, seq, scoring);
-    let masks = build_masks::<S>(S::NEG_INF);
-    let penalties = build_penalties::<S>(S::Elem::from_i32(i32::from(scoring.e)));
+    reseed_scalar_buffers(seeded, alignment_type, scoring, seq, graph);
+    build_profile::<S>(&mut striped.profile, graph, seq, scoring);
+    // Cached once per element width (see `align_simd_linear`); affine's ladder uses the extend `e`.
+    let elem_width = core::mem::size_of::<S::Elem>();
+    if striped.cached_elem_width != elem_width {
+        striped.masks = build_masks::<S>(S::NEG_INF);
+        striped.penalties = build_penalties::<S>(S::Elem::from_i32(i32::from(scoring.e)));
+        striped.cached_elem_width = elem_width;
+    }
 
-    let (striped_h, striped_e, striped_f, max_i, max_j, max_score) = fill::fill_affine::<S>(
+    let (max_i, max_j, max_score) = fill::fill_affine::<S>(
         graph,
         seq.len(),
         scoring,
         alignment_type,
-        &seeded,
-        &simd_profile,
-        &masks,
-        &penalties,
+        seeded,
+        &striped.profile,
+        &striped.masks,
+        &striped.penalties,
+        &mut striped.h,
+        &mut striped.e,
+        &mut striped.f,
     );
 
     // Destripe only the interior rows (rows 1..); row 0 is the boundary already in the seeded
@@ -307,19 +558,19 @@ where
     let matrix_width_vecs = seq.len().div_ceil(S::LANES);
     destripe_interior::<S>(
         &mut seeded.h,
-        &striped_h[matrix_width_vecs..],
+        &striped.h[matrix_width_vecs..],
         matrix_width_vecs,
         seq.len(),
     );
     destripe_interior::<S>(
         &mut seeded.e,
-        &striped_e[matrix_width_vecs..],
+        &striped.e[matrix_width_vecs..],
         matrix_width_vecs,
         seq.len(),
     );
     destripe_interior::<S>(
         &mut seeded.f,
-        &striped_f[matrix_width_vecs..],
+        &striped.f[matrix_width_vecs..],
         matrix_width_vecs,
         seq.len(),
     );
@@ -357,58 +608,63 @@ where
 /// Only reached after the caller's runtime ISA feature check selected an ISA whose `target_feature`
 /// code inside `S` is therefore sound (see [`align_simd_linear`]).
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
 fn align_simd_convex<S>(
     alignment_type: AlignmentType,
     scoring: Scoring,
     seq: &[u8],
     graph: &Graph,
+    seeded: &mut ScalarInit,
+    striped: &mut StripedBuffers<S::Vec>,
 ) -> (Alignment, i32)
 where
     S: lanes::Simd,
     S::Elem: profile::ElemFromI32 + profile::ElemToI32,
 {
     use crate::align::backtrack::backtrack_convex;
-    use profile::{
-        build_masks, build_penalties, build_profile, destripe_interior, seed_scalar_buffers,
-        ElemFromI32,
-    };
+    use crate::align::sisd::reseed_scalar_buffers;
+    use profile::{build_masks, build_penalties, build_profile, destripe_interior, ElemFromI32};
 
-    let mut seeded = seed_scalar_buffers(graph, seq, scoring, alignment_type);
-    let simd_profile = build_profile::<S>(graph, seq, scoring);
-    let masks = build_masks::<S>(S::NEG_INF);
-    // Two ladders: the first affine's E uses the extend `e`, the second affine's Q uses `c`.
-    let penalties_e = build_penalties::<S>(S::Elem::from_i32(i32::from(scoring.e)));
-    let penalties_c = build_penalties::<S>(S::Elem::from_i32(i32::from(scoring.c)));
+    reseed_scalar_buffers(seeded, alignment_type, scoring, seq, graph);
+    build_profile::<S>(&mut striped.profile, graph, seq, scoring);
+    // Cached once per element width (see `align_simd_linear`). Two ladders: the first affine's E
+    // uses the extend `e`, the second affine's Q uses `c`.
+    let elem_width = core::mem::size_of::<S::Elem>();
+    if striped.cached_elem_width != elem_width {
+        striped.masks = build_masks::<S>(S::NEG_INF);
+        striped.penalties = build_penalties::<S>(S::Elem::from_i32(i32::from(scoring.e)));
+        striped.penalties_c = build_penalties::<S>(S::Elem::from_i32(i32::from(scoring.c)));
+        striped.cached_elem_width = elem_width;
+    }
 
-    let (striped_h, striped_e, striped_f, striped_o, striped_q, max_i, max_j, max_score) =
-        fill::fill_convex::<S>(
-            graph,
-            seq.len(),
-            scoring,
-            alignment_type,
-            &seeded,
-            &simd_profile,
-            &masks,
-            &penalties_e,
-            &penalties_c,
-        );
+    let (max_i, max_j, max_score) = fill::fill_convex::<S>(
+        graph,
+        seq.len(),
+        scoring,
+        alignment_type,
+        seeded,
+        &striped.profile,
+        &striped.masks,
+        &striped.penalties,
+        &striped.penalties_c,
+        &mut striped.h,
+        &mut striped.e,
+        &mut striped.f,
+        &mut striped.o,
+        &mut striped.q,
+    );
 
     // Destripe only the interior rows (rows 1..); row 0 is the boundary already in the seeded
     // buffers, which `destripe_interior` never touches.
     let matrix_width_vecs = seq.len().div_ceil(S::LANES);
-    for (dst, striped) in [
-        (&mut seeded.h, &striped_h),
-        (&mut seeded.e, &striped_e),
-        (&mut seeded.f, &striped_f),
-        (&mut seeded.o, &striped_o),
-        (&mut seeded.q, &striped_q),
+    for (dst, src) in [
+        (&mut seeded.h, &striped.h),
+        (&mut seeded.e, &striped.e),
+        (&mut seeded.f, &striped.f),
+        (&mut seeded.o, &striped.o),
+        (&mut seeded.q, &striped.q),
     ] {
-        destripe_interior::<S>(
-            dst,
-            &striped[matrix_width_vecs..],
-            matrix_width_vecs,
-            seq.len(),
-        );
+        destripe_interior::<S>(dst, &src[matrix_width_vecs..], matrix_width_vecs, seq.len());
     }
 
     let alignment = backtrack_convex(
@@ -430,6 +686,108 @@ where
     (alignment, max_score)
 }
 
+// ---- Per-ISA `#[target_feature]` entry wrappers ---------------------------------------------
+//
+// Each wrapper carries its ISA's `#[target_feature]` and calls straight into the generic
+// `align_simd_*` pipeline. Because that pipeline — `align_simd_*` → `fill_*` → the `Simd` trait
+// ops → the same-feature intrinsic islands (`add16` etc.) — is `#[inline]`/`#[inline(always)]`
+// throughout, the ENTIRE tree inlines into this one feature-enabled function, and the intrinsic
+// islands (same feature) then inline into that feature-enabled context. This reproduces
+// minimap2's "whole translation unit compiled with `-mavx2`" trick: the hot DP loop compiles to
+// inline vector instructions instead of one non-inlined `call` per vector op. Without the
+// wrapper the plain generic pipeline lacks the target feature, so a `#[target_feature]` op helper
+// cannot be inlined into it (a target-feature fn never inlines into a caller lacking the feature)
+// and every vector op in the hot loop became a non-inlined call — ~4x slower than scalar on AVX2.
+//
+// # Safety
+//
+// Every wrapper is an `unsafe fn` solely because `#[target_feature]` requires it; the single
+// precondition is that the running CPU actually has the named feature. [`SimdEngine::align`]
+// reaches a given wrapper only through the [`Isa`] arm that [`detect_isa`] selected, and
+// `detect_isa` returns `Isa::Avx2`/`Isa::Sse41`/`Isa::Neon` only after the matching
+// `is_x86_feature_detected!("avx2")` / `is_x86_feature_detected!("sse4.1")` /
+// `is_aarch64_feature_detected!("neon")` returned true. So the feature is guaranteed present at
+// every call site (each `unsafe { run_*::<_>(...) }` below documents this same invariant).
+macro_rules! define_simd_runners {
+    ($arch:literal, $feature:literal, $linear:ident, $affine:ident, $convex:ident) => {
+        #[cfg(target_arch = $arch)]
+        #[target_feature(enable = $feature)]
+        unsafe fn $linear<S>(
+            alignment_type: AlignmentType,
+            scoring: Scoring,
+            seq: &[u8],
+            graph: &Graph,
+            seeded: &mut ScalarInit,
+            striped: &mut StripedBuffers<S::Vec>,
+        ) -> (Alignment, i32)
+        where
+            S: lanes::Simd,
+            S::Elem: profile::ElemFromI32 + profile::ElemToI32,
+        {
+            align_simd_linear::<S>(alignment_type, scoring, seq, graph, seeded, striped)
+        }
+
+        #[cfg(target_arch = $arch)]
+        #[target_feature(enable = $feature)]
+        unsafe fn $affine<S>(
+            alignment_type: AlignmentType,
+            scoring: Scoring,
+            seq: &[u8],
+            graph: &Graph,
+            seeded: &mut ScalarInit,
+            striped: &mut StripedBuffers<S::Vec>,
+        ) -> (Alignment, i32)
+        where
+            S: lanes::Simd,
+            S::Elem: profile::ElemFromI32 + profile::ElemToI32,
+        {
+            align_simd_affine::<S>(alignment_type, scoring, seq, graph, seeded, striped)
+        }
+
+        #[cfg(target_arch = $arch)]
+        #[target_feature(enable = $feature)]
+        unsafe fn $convex<S>(
+            alignment_type: AlignmentType,
+            scoring: Scoring,
+            seq: &[u8],
+            graph: &Graph,
+            seeded: &mut ScalarInit,
+            striped: &mut StripedBuffers<S::Vec>,
+        ) -> (Alignment, i32)
+        where
+            S: lanes::Simd,
+            S::Elem: profile::ElemFromI32 + profile::ElemToI32,
+        {
+            align_simd_convex::<S>(alignment_type, scoring, seq, graph, seeded, striped)
+        }
+    };
+}
+
+define_simd_runners!(
+    "x86_64",
+    "avx2",
+    run_avx2_linear,
+    run_avx2_affine,
+    run_avx2_convex
+);
+define_simd_runners!(
+    "x86_64",
+    "sse4.1",
+    run_sse41_linear,
+    run_sse41_affine,
+    run_sse41_convex
+);
+// NEON is architecturally baseline on aarch64, so its intrinsic islands already inline freely
+// (this is why NEON never hit the x86 cliff); the wrapper is added for symmetry so the dispatch
+// is uniform across all three ISAs.
+define_simd_runners!(
+    "aarch64",
+    "neon",
+    run_neon_linear,
+    run_neon_affine,
+    run_neon_convex
+);
+
 impl AlignmentEngine for SimdEngine {
     /// Aligns `seq` against `graph`.
     ///
@@ -437,14 +795,14 @@ impl AlignmentEngine for SimdEngine {
     /// (`simd_alignment_engine_implementation.hpp:653-672`): an empty graph or empty sequence
     /// short-circuits to `(Alignment::new(), 0)` before any kernel selection (this also sidesteps
     /// divide-by-`LANES` / empty-rank indexing a real kernel would otherwise have to guard); then
-    /// [`escalate`] picks the int16/int32/fallback tier and [`detect_isa`] picks the ISA. The
-    /// SSE4.1 (x86_64) and NEON (aarch64) branches of both tiers run a real vectorized kernel via
-    /// the SAME generic `align_simd_*` pipelines (SIMD kernels plan Tasks 7-12): SSE4.1 with
-    /// [`sse41::Sse41I16`]/[`sse41::Sse41I32`], NEON with `neon::NeonI16`/`neon::NeonI32`. The
-    /// remaining `(Escalation, Isa)` combinations (AVX2, no ISA) still delegate to the internal
-    /// [`SisdEngine`] for now (later tasks replace each remaining `// TODO(SIMD Task N+)` marker
-    /// with a real `fill_*::<Kernel>` call), so this is correct, if not yet fast on those ISAs, by
-    /// construction: it always returns exactly what `SisdEngine::align` would.
+    /// [`escalate`] picks the int16/int32/fallback tier and [`detect_isa`] picks the ISA. Every
+    /// real ISA runs a genuine vectorized kernel through the SAME generic `align_simd_*` pipelines:
+    /// AVX2 (`avx2::Avx2I16`/`avx2::Avx2I32`) and SSE4.1
+    /// ([`sse41::Sse41I16`]/[`sse41::Sse41I32`]) on x86_64, NEON (`neon::NeonI16`/`neon::NeonI32`)
+    /// on aarch64, at both the int16 and int32 tiers. Only [`Escalation::Fallback`] (scores that
+    /// would overflow even `i32`) and [`Isa::None`] (no usable vectorized ISA detected) delegate to
+    /// the internal [`SisdEngine`]. Whichever path is taken, the result is bit-identical to
+    /// `SisdEngine::align` by construction (every kernel is validated against it).
     fn align(&mut self, seq: &[u8], graph: &Graph) -> (Alignment, i32) {
         if graph.nodes.is_empty() || seq.is_empty() {
             return (Alignment::new(), 0);
@@ -452,6 +810,12 @@ impl AlignmentEngine for SimdEngine {
 
         let escalation = escalate(&self.scoring, seq.len(), graph.nodes.len());
         let isa = detect_isa();
+
+        // Snapshot the `Copy` routing inputs up front so the per-ISA arms below can take a `&mut`
+        // borrow of `self`'s scratch fields (via the `*_scratch` accessors) without also borrowing
+        // `self` for these reads.
+        let alignment_type = self.alignment_type;
+        let scoring = self.scoring;
 
         match escalation {
             // Worst case overflows even i32: no vectorized kernel is safe at any ISA.
@@ -468,25 +832,38 @@ impl AlignmentEngine for SimdEngine {
                     {
                         use crate::align::GapMode;
                         use avx2::Avx2I32;
-                        match self.scoring.gap_mode() {
-                            GapMode::Linear => align_simd_linear::<Avx2I32>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
-                            GapMode::Affine => align_simd_affine::<Avx2I32>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
-                            GapMode::Convex => align_simd_convex::<Avx2I32>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
+                        let (scratch, striped) = self.avx2_scratch();
+                        match scoring.gap_mode() {
+                            GapMode::Linear => unsafe {
+                                run_avx2_linear::<Avx2I32>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
+                            GapMode::Affine => unsafe {
+                                run_avx2_affine::<Avx2I32>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
+                            GapMode::Convex => unsafe {
+                                run_avx2_convex::<Avx2I32>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
                         }
                     }
                     #[cfg(not(target_arch = "x86_64"))]
@@ -506,25 +883,38 @@ impl AlignmentEngine for SimdEngine {
                     {
                         use crate::align::GapMode;
                         use sse41::Sse41I32;
-                        match self.scoring.gap_mode() {
-                            GapMode::Linear => align_simd_linear::<Sse41I32>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
-                            GapMode::Affine => align_simd_affine::<Sse41I32>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
-                            GapMode::Convex => align_simd_convex::<Sse41I32>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
+                        let (scratch, striped) = self.sse41_scratch();
+                        match scoring.gap_mode() {
+                            GapMode::Linear => unsafe {
+                                run_sse41_linear::<Sse41I32>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
+                            GapMode::Affine => unsafe {
+                                run_sse41_affine::<Sse41I32>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
+                            GapMode::Convex => unsafe {
+                                run_sse41_convex::<Sse41I32>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
                         }
                     }
                     #[cfg(not(target_arch = "x86_64"))]
@@ -542,25 +932,38 @@ impl AlignmentEngine for SimdEngine {
                     {
                         use crate::align::GapMode;
                         use neon::NeonI32;
-                        match self.scoring.gap_mode() {
-                            GapMode::Linear => align_simd_linear::<NeonI32>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
-                            GapMode::Affine => align_simd_affine::<NeonI32>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
-                            GapMode::Convex => align_simd_convex::<NeonI32>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
+                        let (scratch, striped) = self.neon_i32_scratch();
+                        match scoring.gap_mode() {
+                            GapMode::Linear => unsafe {
+                                run_neon_linear::<NeonI32>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
+                            GapMode::Affine => unsafe {
+                                run_neon_affine::<NeonI32>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
+                            GapMode::Convex => unsafe {
+                                run_neon_convex::<NeonI32>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
                         }
                     }
                     #[cfg(not(target_arch = "aarch64"))]
@@ -582,25 +985,38 @@ impl AlignmentEngine for SimdEngine {
                     {
                         use crate::align::GapMode;
                         use avx2::Avx2I16;
-                        match self.scoring.gap_mode() {
-                            GapMode::Linear => align_simd_linear::<Avx2I16>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
-                            GapMode::Affine => align_simd_affine::<Avx2I16>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
-                            GapMode::Convex => align_simd_convex::<Avx2I16>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
+                        let (scratch, striped) = self.avx2_scratch();
+                        match scoring.gap_mode() {
+                            GapMode::Linear => unsafe {
+                                run_avx2_linear::<Avx2I16>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
+                            GapMode::Affine => unsafe {
+                                run_avx2_affine::<Avx2I16>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
+                            GapMode::Convex => unsafe {
+                                run_avx2_convex::<Avx2I16>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
                         }
                     }
                     #[cfg(not(target_arch = "x86_64"))]
@@ -619,25 +1035,38 @@ impl AlignmentEngine for SimdEngine {
                     {
                         use crate::align::GapMode;
                         use sse41::Sse41I16;
-                        match self.scoring.gap_mode() {
-                            GapMode::Linear => align_simd_linear::<Sse41I16>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
-                            GapMode::Affine => align_simd_affine::<Sse41I16>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
-                            GapMode::Convex => align_simd_convex::<Sse41I16>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
+                        let (scratch, striped) = self.sse41_scratch();
+                        match scoring.gap_mode() {
+                            GapMode::Linear => unsafe {
+                                run_sse41_linear::<Sse41I16>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
+                            GapMode::Affine => unsafe {
+                                run_sse41_affine::<Sse41I16>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
+                            GapMode::Convex => unsafe {
+                                run_sse41_convex::<Sse41I16>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
                         }
                     }
                     #[cfg(not(target_arch = "x86_64"))]
@@ -655,25 +1084,38 @@ impl AlignmentEngine for SimdEngine {
                     {
                         use crate::align::GapMode;
                         use neon::NeonI16;
-                        match self.scoring.gap_mode() {
-                            GapMode::Linear => align_simd_linear::<NeonI16>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
-                            GapMode::Affine => align_simd_affine::<NeonI16>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
-                            GapMode::Convex => align_simd_convex::<NeonI16>(
-                                self.alignment_type,
-                                self.scoring,
-                                seq,
-                                graph,
-                            ),
+                        let (scratch, striped) = self.neon_i16_scratch();
+                        match scoring.gap_mode() {
+                            GapMode::Linear => unsafe {
+                                run_neon_linear::<NeonI16>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
+                            GapMode::Affine => unsafe {
+                                run_neon_affine::<NeonI16>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
+                            GapMode::Convex => unsafe {
+                                run_neon_convex::<NeonI16>(
+                                    alignment_type,
+                                    scoring,
+                                    seq,
+                                    graph,
+                                    scratch,
+                                    striped,
+                                )
+                            },
                         }
                     }
                     #[cfg(not(target_arch = "aarch64"))]
@@ -841,5 +1283,20 @@ mod tests {
         let graph = linear_graph(b"ACGTACGTAC");
         let scoring = Scoring::new(5, -4, -8, -6, -10, -4).unwrap();
         assert_matches_sisd(AlignmentType::Global, scoring, b"ACGTTCGTAC", &graph);
+    }
+
+    /// The `SPOARS_FORCE_ISA` downgrade decision: only the literal `sse41` (any case) requests
+    /// suppressing AVX2; unset/empty/other values leave normal detection in place. Tests the pure
+    /// helper directly so the decision is covered without an AVX2 CPU.
+    #[test]
+    fn should_force_sse41_only_matches_the_sse41_token() {
+        assert!(should_force_sse41(Some("sse41")));
+        assert!(should_force_sse41(Some("SSE41")));
+        assert!(should_force_sse41(Some("Sse41")));
+        assert!(!should_force_sse41(None));
+        assert!(!should_force_sse41(Some("")));
+        assert!(!should_force_sse41(Some("avx2")));
+        assert!(!should_force_sse41(Some("sse4.1")));
+        assert!(!should_force_sse41(Some("neon")));
     }
 }
