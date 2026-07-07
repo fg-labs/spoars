@@ -181,7 +181,10 @@ fn bench_align_one_banded(c: &mut Criterion) {
         }
         let (_truth, reads) = family(len, n, SEED);
         let (init, last) = reads.split_at(n - 1);
-        let graph = build_simd_banded(init);
+        // Build the (n-1)-read graph with the EXACT engine — the SAME construction
+        // `bench_align_one` uses — so the only variable between the two align-only benchmarks is
+        // banded vs exact *alignment* of the last read, not a different input graph topology.
+        let graph = build_simd(init);
         let last = last[0].clone();
         let mut engine = SimdEngine::banded(
             AlignmentType::Global,
