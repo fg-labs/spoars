@@ -1565,21 +1565,40 @@ mod tests {
     /// than a tiny band (`base = 2, frac = 0.0`) is missed by the banded engine (its score differs
     /// from — and is no better than — the exact score), yet the banded engine still returns a
     /// STRUCTURALLY VALID alignment (no panic, every emitted node/query index is `-1` or in range).
+    ///
+    /// The band's *effective* computed region is quantized to `LANES`-wide segments
+    /// (`[beg_sn * LANES, end_sn * LANES)`), so a band that is narrow in query columns still rounds
+    /// out to at least one full segment — up to 16 columns on AVX2's 16-lane int16 tier (vs 8 on
+    /// SSE4.1/NEON). To make the "must miss" premise hold on EVERY ISA (not just narrow-lane ones),
+    /// the fixture uses a long backbone and an insertion (48 bp) far larger than the widest possible
+    /// segment-quantized band, and long enough that the node-count anchor is badly off-diagonal for
+    /// the surrounding backbone — so the tiny band cannot reach the wide-gap optimum regardless of
+    /// lane width. (An earlier 20 bp / 12 bp fixture passed on 8-lane ISAs but spuriously *equalled*
+    /// exact on 16-lane AVX2, where a w=2 band rounds out to ~the whole short matrix.)
     #[test]
     fn banded_engine_documents_large_indel_miss() {
         let alignment_type = AlignmentType::Global;
         let scoring = Scoring::spoa_default();
-        let graph = linear_graph(b"ACGTACGTACGTACGTACGT"); // 20 bp
 
-        // Same base with a 12-base run inserted in the middle — far wider than a w=2 band.
-        let query = b"ACGTACGTACTTTTTTTTTTTTGTACGTACGT";
+        // 120 bp linear backbone.
+        let backbone: Vec<u8> = b"ACGT".iter().cycle().take(120).copied().collect();
+        let graph = linear_graph(&backbone);
+
+        // Same backbone with a 48 bp non-backbone run inserted at the midpoint — far wider than any
+        // LANES-quantized `w = 2` band (<= ~16 columns even on AVX2), so the wide-gap optimum is
+        // unreachable in-band on every ISA.
+        let insertion = b"GGCCGGCCGGCCGGCCGGCCGGCCGGCCGGCCGGCCGGCCGGCCGGCC"; // 48 bp
+        let mut query = Vec::with_capacity(backbone.len() + insertion.len());
+        query.extend_from_slice(&backbone[..60]);
+        query.extend_from_slice(insertion);
+        query.extend_from_slice(&backbone[60..]);
 
         let mut exact = SimdEngine::new(alignment_type, scoring);
         let mut banded =
             SimdEngine::banded(alignment_type, scoring, BandConfig { base: 2, frac: 0.0 });
 
-        let (_exact_alignment, exact_score) = exact.align(query, &graph);
-        let (banded_alignment, banded_score) = banded.align(query, &graph);
+        let (_exact_alignment, exact_score) = exact.align(&query, &graph);
+        let (banded_alignment, banded_score) = banded.align(&query, &graph);
 
         // The tiny band cannot represent the wide indel, so it cannot reach the exact optimum.
         assert_ne!(
