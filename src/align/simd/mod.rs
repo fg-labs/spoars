@@ -452,8 +452,9 @@ impl SimdEngine {
 /// [`Isa::Sse41`], `is_aarch64_feature_detected!("neon")` for [`Isa::Neon`]) selected an ISA whose
 /// `target_feature` code inside `S` is therefore sound (see each backend's module Safety note).
 ///
-/// `band` is plumbing for the (not-yet-active) banded fill: `None` reproduces today's full-matrix
-/// behavior exactly; it is otherwise unused for now.
+/// `band = Some(..)` activates the banded fill and its `is_banded && max_score == NEG_INF`
+/// Global/Overlap sentinel guard (a banded run that reaches no valid end-to-end endpoint collapses
+/// to an empty alignment); `None` reproduces the exact full-matrix path.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn align_simd_linear<S>(
@@ -548,8 +549,9 @@ where
 /// Only reached after the caller's runtime ISA feature check selected an ISA whose `target_feature`
 /// code inside `S` is therefore sound (see [`align_simd_linear`]).
 ///
-/// `band` is plumbing for the (not-yet-active) banded fill: `None` reproduces today's full-matrix
-/// behavior exactly; it is otherwise unused for now.
+/// `band = Some(..)` activates the banded fill and its `is_banded && max_score == NEG_INF`
+/// Global/Overlap sentinel guard (a banded run that reaches no valid end-to-end endpoint collapses
+/// to an empty alignment); `None` reproduces the exact full-matrix path.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn align_simd_affine<S>(
@@ -697,8 +699,9 @@ where
 /// Only reached after the caller's runtime ISA feature check selected an ISA whose `target_feature`
 /// code inside `S` is therefore sound (see [`align_simd_linear`]).
 ///
-/// `band` is plumbing for the (not-yet-active) banded fill: `None` reproduces today's full-matrix
-/// behavior exactly; it is otherwise unused for now.
+/// `band = Some(..)` activates the banded fill and its `is_banded && max_score == NEG_INF`
+/// Global/Overlap sentinel guard (a banded run that reaches no valid end-to-end endpoint collapses
+/// to an empty alignment); `None` reproduces the exact full-matrix path.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn align_simd_convex<S>(

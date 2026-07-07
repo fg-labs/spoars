@@ -58,10 +58,6 @@ impl BandConfig {
 /// node can differ from `R[n]`; the anchor derived from `R` via [`anchor`] absorbs that slack via
 /// [`BandConfig`]'s half-width rather than tracking it exactly. This mirrors abPOA's own banding
 /// heuristic.
-// Not yet called outside this module's own tests: a later banded-POA task wires this into the
-// SIMD fill's band-derivation step (see `ScalarInit`'s identical `#[allow(dead_code)]` rationale
-// in `sisd.rs`).
-#[allow(dead_code)]
 pub(crate) fn remaining_path(graph: &crate::graph::Graph, node_id_to_rank: &[u32]) -> Vec<u32> {
     let rank_to_node = graph.rank_order();
     let mut r = vec![0u32; rank_to_node.len()];
@@ -95,8 +91,6 @@ pub(crate) fn remaining_path(graph: &crate::graph::Graph, node_id_to_rank: &[u32
 /// where `L = query_len`. `saturating_sub` alone already yields a value in `[0, L]` (it cannot
 /// underflow past 0, and subtracting a non-negative amount from `L` cannot exceed `L`), so no
 /// separate upper clamp is needed.
-// See `remaining_path`'s identical `#[allow(dead_code)]` rationale immediately above.
-#[allow(dead_code)]
 pub(crate) fn anchor(r_len: u32, query_len: usize) -> usize {
     query_len.saturating_sub(r_len as usize)
 }
@@ -104,9 +98,6 @@ pub(crate) fn anchor(r_len: u32, query_len: usize) -> usize {
 /// Half-open query-column window for a node: union of its anchor with its predecessors' best
 /// columns `[Mstart, Mend]`, widened by `w` on each side and clamped to `[0, L]`. A source node
 /// passes `mstart = mend = anchor`.
-// See `remaining_path`'s identical `#[allow(dead_code)]` rationale above: not yet wired into the
-// SIMD fill's per-row band derivation (a later banded-POA task).
-#[allow(dead_code)]
 pub(crate) fn node_window(
     anchor: usize,
     mstart: usize,
@@ -117,7 +108,7 @@ pub(crate) fn node_window(
     let lo = mstart.min(anchor);
     let hi = mend.max(anchor);
     let beg = lo.saturating_sub(w);
-    let end = (hi + w + 1).min(query_len);
+    let end = hi.saturating_add(w).saturating_add(1).min(query_len);
     (beg, end)
 }
 
@@ -125,7 +116,6 @@ pub(crate) fn node_window(
 /// the row block and guaranteed **non-empty** (MINOR 6). `beg_sn` floors, `end_sn` ceils — so the
 /// effective computed band is `[beg_sn*lanes, end_sn*lanes)`; the left-edge carry closure therefore
 /// happens at `beg_sn*lanes`, which unit tests must target (not the unquantized `beg`).
-#[allow(dead_code)]
 pub(crate) fn segment_range(
     beg: usize,
     end: usize,
@@ -143,7 +133,6 @@ pub(crate) fn segment_range(
 /// Per-align band scratch: precomputed `R` (by rank), the half-width `w`, and a `best_col` buffer
 /// filled incrementally as the fill reaches each row. `best_col[rank]` is set to the query column of
 /// that row's max via the `LANES`-independent `index_of` flat-scan (MINOR 5 determinism), by the fill.
-#[allow(dead_code)]
 pub(crate) struct BandState {
     pub(crate) r: Vec<u32>,
     pub(crate) best_col: Vec<u32>,
@@ -151,7 +140,6 @@ pub(crate) struct BandState {
 }
 
 impl BandState {
-    #[allow(dead_code)]
     pub(crate) fn new(
         graph: &crate::graph::Graph,
         node_id_to_rank: &[u32],

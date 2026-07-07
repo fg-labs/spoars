@@ -231,9 +231,12 @@ fn row_band(
 /// far from the saturation threshold), so it is used uniformly on both the `None` and `Some` paths —
 /// the parity suite confirms `None` stays bit-exact.
 ///
-/// SW/OV max-tracking (and the recorded `best_col`) reduce over the in-band segments only. Global
-/// endpoint handling is unchanged here (a later task makes it band-aware); the banded gate targets
-/// [`AlignmentType::Local`].
+/// SW/OV max-tracking (and the recorded `best_col`) reduce over the in-band segments only. Global/
+/// Overlap endpoint handling is band-aware: the Global endpoint reads `H[sink, L]` (column L, the
+/// last query column) directly — the "column L or sentinel" rule, never an in-band column scan — and
+/// normalizes an out-of-band or saturated read (`<= sentinel_floor`) to the scalar [`NEG_INF`],
+/// which the caller's `max_score == NEG_INF` guard collapses into an empty alignment. The parity
+/// suite exercises banded Global/Overlap as well as Local.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) fn fill_linear<S>(
@@ -403,18 +406,19 @@ where
         // `LANES`-independent `index_of` flat-scan over the IN-BAND slice (determinism across ISAs,
         // §best_col propagation), offset by `beg_col`; the next row's Mstart/Mend read it.
         //
-        // For Overlap, `row_best` must use the UNCLAMPED [`row_max`] rather than the 0-floored
-        // [`Simd::horizontal_max`]: `hv` is never floored for Overlap (only `AlignmentType::Local`
-        // clamps a few lines above), so a genuinely negative Overlap row max would make the floored
-        // `horizontal_max` return `0` — a value matching no in-band cell — sending `index_of` to
-        // `-1` and mis-centering the next row's window by at least one column. Local/Global keep the
-        // floored reduction (it matches `hv`'s own clamping there, so it always finds a real cell).
+        // For Global AND Overlap, `row_best` must use the UNCLAMPED [`row_max`] rather than the
+        // 0-floored [`Simd::horizontal_max`]: `hv` is floored only for `AlignmentType::Local` (the
+        // clamp a few lines above), so under Global/Overlap a genuinely negative row max would make
+        // the floored `horizontal_max` return `0` — a value matching no in-band cell — sending
+        // `index_of` to `-1` and mis-centering the next row's window by at least one column. Only
+        // Local keeps the floored `horizontal_max` (it matches `hv`'s own clamping there — where
+        // `hv >= 0` always — preserving the exact upstream Smith-Waterman clamp semantics).
         if let Some(state) = band.as_deref_mut() {
             let rank = node_id_to_rank[node_id.0 as usize] as usize;
-            let row_best = if alignment_type == AlignmentType::Overlap {
-                row_max::<S>(score)
-            } else {
+            let row_best = if alignment_type == AlignmentType::Local {
                 S::horizontal_max(score).to_i32()
+            } else {
+                row_max::<S>(score)
             };
             let col = index_of::<S>(
                 &striped_h[row_base + beg_sn..row_base + end_sn],
@@ -564,8 +568,11 @@ where
 /// winning a `max`; on real DP values these are bit-identical to `add`/`sub` (escalation guard), so
 /// they are used uniformly on the `None` and `Some` paths and the parity suite confirms `None` stays
 /// bit-exact. SW/OV max-tracking and the recorded `best_col` reduce over the in-band segments only;
-/// Global endpoint handling is unchanged here (a later task makes it band-aware), so the banded gate
-/// targets [`AlignmentType::Local`].
+/// Global/Overlap endpoint handling is band-aware: the Global endpoint reads `H[sink, L]` (column L,
+/// the last query column) directly — the "column L or sentinel" rule, never an in-band column scan —
+/// and normalizes an out-of-band or saturated read (`<= sentinel_floor`) to the scalar [`NEG_INF`],
+/// which the caller's `max_score == NEG_INF` guard collapses into an empty alignment. The parity
+/// suite exercises banded Global/Overlap as well as Local.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) fn fill_affine<S>(
@@ -738,15 +745,16 @@ where
         // `LANES`-independent `index_of` flat-scan over the IN-BAND slice offset by `beg_col`, exactly
         // as `fill_linear` does; the next row's Mstart/Mend read it.
         //
-        // Overlap uses the UNCLAMPED [`row_max`] here, not the 0-floored [`Simd::horizontal_max`] —
-        // see the identical fix (and its rationale) in [`fill_linear`]'s best_col recording. Local/
-        // Global are unaffected: they keep the floored reduction.
+        // Global AND Overlap use the UNCLAMPED [`row_max`] here, not the 0-floored
+        // [`Simd::horizontal_max`] — see the identical fix (and its rationale) in [`fill_linear`]'s
+        // best_col recording. Only Local keeps the floored `horizontal_max` (its `hv >= 0` clamp
+        // makes the two reductions identical there, preserving upstream Smith-Waterman semantics).
         if let Some(state) = band.as_deref_mut() {
             let rank = node_id_to_rank[node_id.0 as usize] as usize;
-            let row_best = if alignment_type == AlignmentType::Overlap {
-                row_max::<S>(score)
-            } else {
+            let row_best = if alignment_type == AlignmentType::Local {
                 S::horizontal_max(score).to_i32()
+            } else {
+                row_max::<S>(score)
             };
             let col = index_of::<S>(
                 &striped_h[row_base + beg_sn..row_base + end_sn],
@@ -904,8 +912,11 @@ where
 /// winning a `max`; on real DP values these are bit-identical to `add`/`sub` (escalation guard), so
 /// they are used uniformly on the `None` and `Some` paths and the parity suite confirms `None` stays
 /// bit-exact. SW/OV max-tracking and the recorded `best_col` reduce over the in-band segments only;
-/// Global endpoint handling is unchanged here (a later task makes it band-aware), so the banded gate
-/// targets [`AlignmentType::Local`].
+/// Global/Overlap endpoint handling is band-aware: the Global endpoint reads `H[sink, L]` (column L,
+/// the last query column) directly — the "column L or sentinel" rule, never an in-band column scan —
+/// and normalizes an out-of-band or saturated read (`<= sentinel_floor`) to the scalar [`NEG_INF`],
+/// which the caller's `max_score == NEG_INF` guard collapses into an empty alignment. The parity
+/// suite exercises banded Global/Overlap as well as Local.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) fn fill_convex<S>(
@@ -1115,15 +1126,16 @@ where
         // `LANES`-independent `index_of` flat-scan over the IN-BAND slice offset by `beg_col`, exactly
         // as `fill_affine` does; the next row's Mstart/Mend read it.
         //
-        // Overlap uses the UNCLAMPED [`row_max`] here, not the 0-floored [`Simd::horizontal_max`] —
-        // see the identical fix (and its rationale) in [`fill_linear`]'s best_col recording. Local/
-        // Global are unaffected: they keep the floored reduction.
+        // Global AND Overlap use the UNCLAMPED [`row_max`] here, not the 0-floored
+        // [`Simd::horizontal_max`] — see the identical fix (and its rationale) in [`fill_linear`]'s
+        // best_col recording. Only Local keeps the floored `horizontal_max` (its `hv >= 0` clamp
+        // makes the two reductions identical there, preserving upstream Smith-Waterman semantics).
         if let Some(state) = band.as_deref_mut() {
             let rank = node_id_to_rank[node_id.0 as usize] as usize;
-            let row_best = if alignment_type == AlignmentType::Overlap {
-                row_max::<S>(score)
-            } else {
+            let row_best = if alignment_type == AlignmentType::Local {
                 S::horizontal_max(score).to_i32()
+            } else {
+                row_max::<S>(score)
             };
             let col = index_of::<S>(
                 &striped_h[row_base + beg_sn..row_base + end_sn],
@@ -2466,6 +2478,104 @@ mod tests {
         assert!(
             banded.2 > NEG_INF,
             "a real overlap endpoint must survive the sentinel normalization untouched",
+        );
+    }
+
+    /// Finding A regression — the banded `best_col` recorder must use the UNCLAMPED [`row_max`] for
+    /// Global (not just Overlap). Global, like Overlap, never floors `hv` to `>= 0` (only Local
+    /// does), so an interior in-band row whose true maximum is genuinely NEGATIVE would, under the
+    /// old `else { horizontal_max }` path, have its `row_best` floored to `0` — a value matching no
+    /// in-band cell — sending [`index_of`] to `-1` and recording `best_col = beg_col - 1`, one
+    /// column LEFT of the band and mis-centering the next row's window.
+    ///
+    /// Fixture: a 48-node homopolymer graph (all `A`) against an all-mismatch query (all `C`) under
+    /// **Global** scoring with a narrow abPOA band (`base = 2`). Every diagonal cell is a mismatch,
+    /// so deep in-band rows are genuinely all-negative while the anchor still drives `beg_col > 0`.
+    /// The test (1) proves non-vacuity — at least one row has a negative in-band max AND `beg_col >
+    /// 0` — and (2) asserts every recorded `best_col[rank]` equals that row's TRUE in-band argmax
+    /// column (a real in-band cell), never `beg_col - 1`. Reverting Finding A (restoring `else {
+    /// horizontal_max }`) turns this RED: the negative rows record `beg_col - 1` instead.
+    #[test]
+    fn banded_global_best_col_uses_unclamped_row_max_on_negative_rows() {
+        let lanes = <TestSimd as Simd>::LANES;
+        let seq = vec![b'A'; 48]; // reference: 48-node homopolymer chain
+        let query = vec![b'C'; 48]; // query mismatches the graph at every column
+        let seq_len = query.len();
+        let matrix_width_vecs = seq_len.div_ceil(lanes);
+        let scoring = Scoring::new(5, -4, -8, -6, -10, -4).unwrap();
+        let alignment_type = AlignmentType::Global;
+
+        let mut graph = Graph::new();
+        graph.add_alignment_weight(&[], &seq, 1).unwrap();
+        let node_id_to_rank = ranks_of(&graph);
+
+        let mut band = BandState::new(
+            &graph,
+            &node_id_to_rank,
+            seq_len,
+            BandConfig { base: 2, frac: 0.0 },
+        );
+        let mut h_band: Vec<<TestSimd as Simd>::Vec> = Vec::new();
+        let _ = run_linear(
+            &graph,
+            &query,
+            scoring,
+            alignment_type,
+            &mut h_band,
+            Some(&mut band),
+        );
+
+        let mut saw_negative_deep_row = false;
+        for &node_id in &graph.rank_to_node {
+            let rank = node_id_to_rank[node_id.0 as usize] as usize;
+            let i = rank + 1;
+            let (_beg, _end, beg_sn, end_sn) = recompute_window(
+                &graph,
+                &node_id_to_rank,
+                &band,
+                node_id,
+                seq_len,
+                lanes,
+                matrix_width_vecs,
+            );
+            let beg_col = beg_sn * lanes;
+
+            // Reproduce the recorder's own reduction: scan the SAME striped in-band segments
+            // [beg_sn, end_sn) the fill's `index_of` scans, find the true (unclamped) max, and take
+            // the FIRST column achieving it. Padding lanes (col >= seq_len) are `NEG_INF` and never
+            // win, exactly as they don't inside `index_of`.
+            let mut true_max = i32::MIN;
+            let mut argmax_col = beg_col;
+            for j in beg_col..(end_sn * lanes) {
+                let v = cell::<TestSimd>(&h_band, matrix_width_vecs, i, j);
+                if v > true_max {
+                    true_max = v;
+                    argmax_col = j;
+                }
+            }
+
+            if true_max < 0 && beg_col > 0 {
+                saw_negative_deep_row = true;
+            }
+
+            // The recorded best_col must be the true in-band argmax — a real in-band column — never
+            // `beg_col - 1` (the buggy `index_of == -1` result).
+            assert_eq!(
+                band.best_col[rank] as usize, argmax_col,
+                "row {i}: best_col must be the true in-band argmax, not beg_col-1 \
+                 (beg_col={beg_col}, true_max={true_max})",
+            );
+            assert!(
+                (band.best_col[rank] as usize) >= beg_col,
+                "row {i}: best_col {} fell LEFT of the band start {beg_col} (index_of returned -1)",
+                band.best_col[rank],
+            );
+        }
+
+        assert!(
+            saw_negative_deep_row,
+            "test is vacuous: no interior in-band row had a negative max with beg_col > 0 \
+             (the exact condition Finding A's bug needs to trigger)",
         );
     }
 }

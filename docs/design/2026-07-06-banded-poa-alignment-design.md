@@ -118,7 +118,7 @@ At 235 bp with `w ≈ 12`, ~25 of ~235 columns computed → up to ~8–9× fewer
 
 - **`src/align/simd/band.rs`** (new): `BandConfig` (+ saturating `width`), `R` reverse pass, per-node `[beg,end)` computation, segment-range helper (half-open + clamp), `best_col` propagation. Unit-tested here.
 - **`src/align/simd/mod.rs`**: `SimdEngine.band` + `banded()` ctor; `align()` dispatch + `max_score == NEG_INF` guard; thread the band into the fills.
-- **`src/align/simd/fill.rs`**: per-row clip; `NEG_INF` band-edge carry closure; saturating adds on the banded path; band-aware max-tracking incl. Global in-band endpoint scan.
+- **`src/align/simd/fill.rs`**: per-row clip; `NEG_INF` band-edge carry closure; saturating adds on the banded path; band-aware max-tracking; the Global endpoint reads `H[sink, L]` (column L or sentinel), never an in-band column scan.
 - **Backtrack: no logic change** (relies on the saturating sentinel from `StripedView`).
 - **`benches/poa.rs`**: banded variants.
 
@@ -146,7 +146,7 @@ A Fable sub-agent adversarially reviewed the first draft against the real fill/b
 - **FATAL 2 — "infinite band ⇒ exact" gate never exercises `beg_sn>0`.** With `w ≥ L`, `beg=0` always. **Resolved:** demoted to a smoke test; PRIMARY gate is now a per-cell exact oracle with the band forced to `beg_sn ≥ 1` (testing §1/§2).
 - **FATAL 3 — left-edge horizontal carry seed impossible/wrong.** The needed cell (`beg−1` in this row) is never computed; a finite seed over-estimates. **Resolved:** seed all band-edge carries to `NEG_INF` (edge closure), matching ksw2 (§Fill clip).
 - **MAJOR 4 — interior `NEG_INF` wraps int16 via repeated `+g`.** Headroom was derived for boundary-only sentinels. **Resolved:** saturating adds on the banded path (§Safety model) + saturation test (§3).
-- **MAJOR 5 — Global endpoint outside band ⇒ `NEG_INF` max + vacuously-passing assert + garbage traceback; multi-sink forced to `anchor=L`.** **Resolved:** band-aware in-band endpoint scan + `max_score==NEG_INF` guard (§Fill clip, §API); multi-sink anchor flagged Open (§Risks) with a fallback.
+- **MAJOR 5 — Global endpoint outside band ⇒ `NEG_INF` max + vacuously-passing assert + garbage traceback; multi-sink forced to `anchor=L`.** **Resolved:** the Global endpoint reads `H[sink, L]` (column L or sentinel), never an in-band column scan, and normalizes an out-of-band/saturated read to `NEG_INF` guarded by `max_score==NEG_INF` (§Fill clip, §API); multi-sink anchor flagged Open (§Risks) with a fallback.
 - **MAJOR 6 — `end_sn = end/LANES` off-by-one when `L % LANES == 0`.** **Resolved:** half-open `[beg_sn, end_sn)` with `end_sn = min(end.div_ceil(LANES), matrix_width_vecs)` (§Band computation.3).
 - **MAJOR 7 — `w = base + round(frac·L)` `u32` overflow; the `u32::MAX` sentinel triggers it.** **Resolved:** compute `w` in `usize`, saturating; no MAX-arithmetic sentinel (§API).
 - **MINOR 8 — `R` node-count is a biased query-offset proxy.** Acknowledged tradeoff (§Band computation.1, §Risks).

@@ -237,9 +237,13 @@ In the `Sse41I32` impl (emulate signed saturating add/sub via 64-bit widen or co
                 _mm_srli_epi32::<31>(a),
                 _mm_set1_epi32(i32::MAX), // a>=0 -> INT_MAX, a<0 -> INT_MIN (INT_MAX+1)
             );
-            // overflow = (a ^ r) & (b ^ r) < 0  (sign bit set)
+            // overflow = (a ^ r) & (b ^ r) < 0  (meaningful only in bit 31 of each lane)
             let overflow = _mm_and_si128(_mm_xor_si128(a, r), _mm_xor_si128(b, r));
-            _mm_blendv_epi8(r, sat, overflow)
+            // `_mm_blendv_epi8` selects per-byte on bit 7, so the lane's sign bit must be
+            // broadcast across all 4 bytes first — `_mm_srai_epi32::<31>` spreads bit 31 to
+            // 0xFFFF_FFFF/0x0000_0000. Skipping this corrupts ~2/3 of overflowing lanes.
+            let overflow_mask = _mm_srai_epi32::<31>(overflow);
+            _mm_blendv_epi8(r, sat, overflow_mask)
         }
     }
     #[target_feature(enable = "sse4.1")]
@@ -249,12 +253,14 @@ In the `Sse41I32` impl (emulate signed saturating add/sub via 64-bit widen or co
             let sat = _mm_add_epi32(_mm_srli_epi32::<31>(a), _mm_set1_epi32(i32::MAX));
             // overflow = (a ^ b) & (a ^ r) < 0
             let overflow = _mm_and_si128(_mm_xor_si128(a, b), _mm_xor_si128(a, r));
-            _mm_blendv_epi8(r, sat, overflow)
+            // blendv needs the sign bit broadcast across the lane (see `adds` above).
+            let overflow_mask = _mm_srai_epi32::<31>(overflow);
+            _mm_blendv_epi8(r, sat, overflow_mask)
         }
     }
 ```
 
-`avx2.rs` — same pattern with `_mm256_*` (`_mm256_adds_epi16`/`_mm256_subs_epi16` native; int32 emulated via `_mm256_add_epi32`/`_mm256_xor_si256`/`_mm256_and_si256`/`_mm256_srli_epi32::<31>`/`_mm256_set1_epi32`/`_mm256_blendv_epi8`).
+`avx2.rs` — same pattern with `_mm256_*` (`_mm256_adds_epi16`/`_mm256_subs_epi16` native; int32 emulated via `_mm256_add_epi32`/`_mm256_xor_si256`/`_mm256_and_si256`/`_mm256_srli_epi32::<31>`/`_mm256_set1_epi32`/`_mm256_blendv_epi8`), including the same `_mm256_srai_epi32::<31>` sign-bit broadcast of the overflow value before the blend.
 
 `neon.rs` — all native: `vqaddq_s16`/`vqsubq_s16` and `vqaddq_s32`/`vqsubq_s32`.
 
