@@ -35,9 +35,9 @@ comparison.
 ## Banded vs exact — measured, not assumed
 
 `SimdEngine::banded(.., BandConfig::default())` is the opt-in, heuristic abPOA-style adaptive
-band (see `docs/design/2026-07-06-banded-poa-alignment-design.md`): it can miss the optimal
-alignment when a read needs an indel wider than the band, so it trades a small accuracy risk
-for a smaller DP search area. It is **not** a drop-in replacement for the exact
+band: it can miss the optimal alignment when a read needs an indel wider than the band, so it
+trades a small accuracy risk for a smaller DP search area. It is **not** a drop-in replacement
+for the exact
 `SimdEngine::new` — use it only when that trade-off is acceptable (near-identical reads,
 which is the common case for a UMI family).
 

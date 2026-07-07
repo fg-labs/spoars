@@ -1,8 +1,10 @@
 //! Band geometry for the opt-in, heuristic abPOA-style banded alignment mode.
 //!
-//! Everything here is pure and `LANES`-independent so it can be unit-tested without a
-//! SIMD backend and produces identical bands on every ISA. See
-//! `docs/design/2026-07-06-banded-poa-alignment-design.md`.
+//! Everything here is pure and unit-testable without a SIMD backend. The geometry it produces —
+//! `R`, `anchor`, `best_col`, and the half-open column window `[beg, end)` — is `LANES`-independent
+//! (identical on every ISA). Note the fill then realizes that window at `LANES`-wide *segment*
+//! granularity (`[beg_sn * LANES, end_sn * LANES)`), so the actual computed region — and thus a
+//! banded result — can still differ across ISAs; every variant satisfies `banded <= exact`.
 
 /// Adaptive-band configuration (abPOA-style). APPROXIMATE: banded alignment may miss the
 /// optimal path when it needs an indel larger than the band. `SimdEngine::new` stays exact
