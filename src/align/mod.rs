@@ -12,6 +12,7 @@ mod backtrack;
 pub mod simd;
 pub mod sisd;
 
+pub use simd::BandConfig;
 pub use simd::SimdEngine;
 pub use sisd::SisdEngine;
 

@@ -15,3 +15,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
+
+# Superpowers-skill artifacts (specs/plans/designs) must never be committed — see the
+# workspace-root CLAUDE.md. Kept out of the repo entirely; this is a backstop.
+/docs/superpowers/

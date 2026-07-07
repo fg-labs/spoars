@@ -22,9 +22,11 @@
 
 use super::lanes::Simd;
 use core::arch::x86_64::{
-    __m128i, _mm_add_epi16, _mm_add_epi32, _mm_cvtepi16_epi32, _mm_loadu_si128, _mm_max_epi16,
-    _mm_max_epi32, _mm_min_epi16, _mm_min_epi32, _mm_or_si128, _mm_set1_epi16, _mm_set1_epi32,
-    _mm_slli_si128, _mm_srli_si128, _mm_storeu_si128, _mm_sub_epi16, _mm_sub_epi32,
+    __m128i, _mm_add_epi16, _mm_add_epi32, _mm_adds_epi16, _mm_and_si128, _mm_blendv_epi8,
+    _mm_cvtepi16_epi32, _mm_loadu_si128, _mm_max_epi16, _mm_max_epi32, _mm_min_epi16,
+    _mm_min_epi32, _mm_or_si128, _mm_set1_epi16, _mm_set1_epi32, _mm_slli_si128, _mm_srai_epi32,
+    _mm_srli_epi32, _mm_srli_si128, _mm_storeu_si128, _mm_sub_epi16, _mm_sub_epi32, _mm_subs_epi16,
+    _mm_xor_si128,
 };
 
 /// `i16::MIN + 1024`, this backend's `kNegativeInfinity` (see [`Simd::NEG_INF`]).
@@ -132,6 +134,27 @@ unsafe fn sub16(a: __m128i, b: __m128i) -> __m128i {
     _mm_sub_epi16(a, b)
 }
 
+/// Lane-typed `i16` **saturating** add. Ports `_mm_adds_epi16` — native saturating hardware
+/// support, unlike the int32 backend (see [`adds32`]) which SSE4.1 has no intrinsic for.
+///
+/// # Safety
+/// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn adds16(a: __m128i, b: __m128i) -> __m128i {
+    _mm_adds_epi16(a, b)
+}
+
+/// Lane-typed `i16` **saturating** sub. Ports `_mm_subs_epi16`.
+///
+/// # Safety
+/// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn subs16(a: __m128i, b: __m128i) -> __m128i {
+    _mm_subs_epi16(a, b)
+}
+
 /// Lane-typed `i16` signed min. Ports `_mm_min_epi16` (`impl:169`).
 ///
 /// # Safety
@@ -191,6 +214,18 @@ impl Simd for Sse41I16 {
     fn sub(a: __m128i, b: __m128i) -> __m128i {
         // SAFETY: see `splat`. Non-saturating `_mm_sub_epi16`.
         unsafe { sub16(a, b) }
+    }
+
+    #[inline(always)]
+    fn adds(a: __m128i, b: __m128i) -> __m128i {
+        // SAFETY: see `splat`. Native saturating `_mm_adds_epi16`.
+        unsafe { adds16(a, b) }
+    }
+
+    #[inline(always)]
+    fn subs(a: __m128i, b: __m128i) -> __m128i {
+        // SAFETY: see `splat`. Native saturating `_mm_subs_epi16`.
+        unsafe { subs16(a, b) }
     }
 
     #[inline(always)]
@@ -306,6 +341,63 @@ unsafe fn sub32(a: __m128i, b: __m128i) -> __m128i {
     _mm_sub_epi32(a, b)
 }
 
+/// The saturation target for an overflowing lane, keyed on `a`'s sign: `a >= 0 -> i32::MAX`,
+/// `a < 0 -> i32::MIN`. Shared by [`adds32`]/[`subs32`] — for both signed add and sub, the
+/// direction of overflow always follows the operand `a`'s sign (see each caller's doc for why).
+/// Computed as `(a >>> 31) + i32::MAX`: the logical shift isolates `a`'s sign bit as a plain `0`
+/// or `1`, and adding `i32::MAX` (`0x7FFF_FFFF`) either leaves it at `i32::MAX` (bit `0`) or wraps
+/// it to `i32::MIN` (`0x7FFF_FFFF + 1 == 0x8000_0000`, bit `1`).
+///
+/// # Safety
+/// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn saturation_target32(a: __m128i) -> __m128i {
+    _mm_add_epi32(_mm_srli_epi32::<31>(a), _mm_set1_epi32(i32::MAX))
+}
+
+/// Lane-typed `i32` **saturating** add: SSE4.1 has no `_mm_adds_epi32` (only int16 saturates
+/// natively — see [`adds16`]), so this emulates it. Computes the wrapping sum `r`, detects
+/// overflow via the classic signed-overflow test `(a ^ r) & (b ^ r) < 0` (overflow iff `a` and `b`
+/// share a sign that differs from `r`'s), and blends in [`saturation_target32`] on overflow.
+///
+/// `_mm_blendv_epi8` selects **per byte** off each byte's own high bit, but the overflow test above
+/// only produces a meaningful signal in bit 31 of each 32-bit lane — the other 3 bytes' high bits
+/// are unrelated noise. `_mm_srai_epi32::<31>` broadcasts that one sign bit across the whole lane
+/// (`0xFFFF_FFFF` on overflow, `0x0000_0000` otherwise) so every byte within a lane agrees on which
+/// operand to select; skipping this step corrupts ~2/3 of overflowing lanes (verified against a
+/// `saturating_add` reference).
+///
+/// # Safety
+/// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn adds32(a: __m128i, b: __m128i) -> __m128i {
+    let r = _mm_add_epi32(a, b);
+    let sat = saturation_target32(a);
+    let overflow = _mm_and_si128(_mm_xor_si128(a, r), _mm_xor_si128(b, r));
+    let overflow_mask = _mm_srai_epi32::<31>(overflow);
+    _mm_blendv_epi8(r, sat, overflow_mask)
+}
+
+/// Lane-typed `i32` **saturating** sub; see [`adds32`] for the emulation rationale (no native
+/// `_mm_subs_epi32`). Overflow test is the signed-subtraction form `(a ^ b) & (a ^ r) < 0`
+/// (overflow iff `a` and `b` differ in sign and `r` differs from `a`); the saturation target still
+/// follows `a`'s sign (overflowing subtraction always overshoots in the direction `a` already
+/// pointed).
+///
+/// # Safety
+/// Caller must guarantee SSE4.1 is available (see the module-level Safety note).
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn subs32(a: __m128i, b: __m128i) -> __m128i {
+    let r = _mm_sub_epi32(a, b);
+    let sat = saturation_target32(a);
+    let overflow = _mm_and_si128(_mm_xor_si128(a, b), _mm_xor_si128(a, r));
+    let overflow_mask = _mm_srai_epi32::<31>(overflow);
+    _mm_blendv_epi8(r, sat, overflow_mask)
+}
+
 /// Lane-typed `i32` signed min. Ports `_mm_min_epi32` (`impl:204`).
 ///
 /// # Safety
@@ -364,6 +456,18 @@ impl Simd for Sse41I32 {
     fn sub(a: __m128i, b: __m128i) -> __m128i {
         // SAFETY: see `splat`. Non-saturating `_mm_sub_epi32`.
         unsafe { sub32(a, b) }
+    }
+
+    #[inline(always)]
+    fn adds(a: __m128i, b: __m128i) -> __m128i {
+        // SAFETY: see `splat`. Emulated saturating add (no native `_mm_adds_epi32`).
+        unsafe { adds32(a, b) }
+    }
+
+    #[inline(always)]
+    fn subs(a: __m128i, b: __m128i) -> __m128i {
+        // SAFETY: see `splat`. Emulated saturating sub (no native `_mm_subs_epi32`).
+        unsafe { subs32(a, b) }
     }
 
     #[inline(always)]
@@ -592,6 +696,42 @@ mod tests {
     }
 
     #[test]
+    fn i16_adds_subs_saturate_at_bounds() {
+        if !is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+        // adds/subs must clamp (native `_mm_adds_epi16`/`_mm_subs_epi16`), unlike add/sub, which
+        // wrap.
+        let hi = Sse41I16::splat(i16::MAX);
+        let lo = Sse41I16::splat(i16::MIN);
+        let one = Sse41I16::splat(1);
+        assert_eq!(unpack16(Sse41I16::adds(hi, one)), [i16::MAX; 8]);
+        assert_eq!(unpack16(Sse41I16::subs(lo, one)), [i16::MIN; 8]);
+
+        let a = [
+            3i16,
+            i16::MAX,
+            -2,
+            i16::MIN,
+            0,
+            i16::MAX - 1,
+            -100,
+            i16::MIN + 1,
+        ];
+        let b = [1i16, 1, -3, -1, -5, 2, -50, -2];
+        let va = Sse41I16::loadu(&a);
+        let vb = Sse41I16::loadu(&b);
+        let mut exp_adds = [0i16; 8];
+        let mut exp_subs = [0i16; 8];
+        for (i, (&ai, &bi)) in a.iter().zip(b.iter()).enumerate() {
+            exp_adds[i] = ai.saturating_add(bi);
+            exp_subs[i] = ai.saturating_sub(bi);
+        }
+        assert_eq!(unpack16(Sse41I16::adds(va, vb)), exp_adds);
+        assert_eq!(unpack16(Sse41I16::subs(va, vb)), exp_subs);
+    }
+
+    #[test]
     fn i16_loadu_storeu_round_trip() {
         if !is_x86_feature_detected!("sse4.1") {
             return;
@@ -731,6 +871,66 @@ mod tests {
         let one = Sse41I32::splat(1);
         assert_eq!(unpack32(Sse41I32::add(hi, one)), [i32::MIN; 4]);
         assert_eq!(unpack32(Sse41I32::sub(lo, one)), [i32::MAX; 4]);
+    }
+
+    /// SSE4.1 has no native `_mm_adds_epi32`/`_mm_subs_epi32` (see [`super::adds32`]/
+    /// [`super::subs32`]), so this is the one test in the crate that actually exercises the x86
+    /// int32 saturation *emulation* against the scalar `saturating_add`/`saturating_sub` oracle —
+    /// boundary values plus a wide pseudo-random sweep, since a hand-derived compare/blend formula
+    /// is exactly the kind of thing that looks right but is subtly wrong for some inputs (as the
+    /// unbroadcast-sign-bit version of this formula was during development).
+    #[test]
+    fn i32_adds_subs_saturate_at_bounds() {
+        if !is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+        let hi = Sse41I32::splat(i32::MAX);
+        let lo = Sse41I32::splat(i32::MIN);
+        let one = Sse41I32::splat(1);
+        assert_eq!(unpack32(Sse41I32::adds(hi, one)), [i32::MAX; 4]);
+        assert_eq!(unpack32(Sse41I32::subs(lo, one)), [i32::MIN; 4]);
+
+        let neg = Sse41I32::NEG_INF;
+        let a = [3i32, i32::MAX, neg, -100];
+        let b = [1i32, 1, -128, -50];
+        let va = Sse41I32::loadu(&a);
+        let vb = Sse41I32::loadu(&b);
+        let mut exp_adds = [0i32; 4];
+        let mut exp_subs = [0i32; 4];
+        for (i, (&ai, &bi)) in a.iter().zip(b.iter()).enumerate() {
+            exp_adds[i] = ai.saturating_add(bi);
+            exp_subs[i] = ai.saturating_sub(bi);
+        }
+        assert_eq!(unpack32(Sse41I32::adds(va, vb)), exp_adds);
+        assert_eq!(unpack32(Sse41I32::subs(va, vb)), exp_subs);
+
+        // Pseudo-random sweep (xorshift, no external RNG dependency) covering the full `i32`
+        // range, including many overflow/underflow-triggering combinations.
+        let mut state: u32 = 0x9E37_79B9;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as i32
+        };
+        for _ in 0..10_000 {
+            let a = [next(), next(), next(), next()];
+            let b = [next(), next(), next(), next()];
+            let va = Sse41I32::loadu(&a);
+            let vb = Sse41I32::loadu(&b);
+            let exp_adds: [i32; 4] = std::array::from_fn(|i| a[i].saturating_add(b[i]));
+            let exp_subs: [i32; 4] = std::array::from_fn(|i| a[i].saturating_sub(b[i]));
+            assert_eq!(
+                unpack32(Sse41I32::adds(va, vb)),
+                exp_adds,
+                "adds mismatch for {a:?} + {b:?}"
+            );
+            assert_eq!(
+                unpack32(Sse41I32::subs(va, vb)),
+                exp_subs,
+                "subs mismatch for {a:?} - {b:?}"
+            );
+        }
     }
 
     #[test]

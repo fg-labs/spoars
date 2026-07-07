@@ -18,6 +18,7 @@
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
+mod band;
 mod fill;
 mod lanes;
 #[cfg(target_arch = "aarch64")]
@@ -26,10 +27,13 @@ mod profile;
 #[cfg(target_arch = "x86_64")]
 mod sse41;
 
+pub use band::BandConfig;
+
 use crate::align::backtrack::CellRead;
-use crate::align::sisd::ScalarInit;
+use crate::align::sisd::{ScalarInit, NEG_INF};
 use crate::align::{Alignment, AlignmentEngine, AlignmentType, Scoring, SisdEngine};
 use crate::graph::Graph;
+use band::BandState;
 
 /// The reused-across-`align`-calls **striped** SIMD scratch for one concrete register type `V`
 /// (`__m128i`/`__m256i`/`int16x8_t`/`int32x4_t`): the striped char profile, the up-to-five striped
@@ -321,6 +325,11 @@ pub struct SimdEngine {
         allow(dead_code)
     )]
     striped: StripedScratch,
+    /// Opt-in, heuristic abPOA-style band. `None` (the [`SimdEngine::new`] default) means the exact,
+    /// spoa-bit-exact fill; `Some(cfg)` makes every [`SimdEngine::align`] build a per-call
+    /// [`BandState`] and restrict the fill to that band. Banded results are **NOT** bit-exact with
+    /// spoa — an alignment needing an indel wider than the band can be missed. See [`BandConfig`].
+    band: Option<BandConfig>,
 }
 
 impl SimdEngine {
@@ -333,7 +342,17 @@ impl SimdEngine {
             inner: SisdEngine::new(alignment_type, scoring),
             scratch: ScalarInit::default(),
             striped: StripedScratch::None,
+            band: None,
         }
+    }
+
+    /// Builds a **banded** (opt-in, heuristic) engine. Unlike [`SimdEngine::new`] this is NOT
+    /// bit-exact with spoa — it may miss alignments needing an indel wider than the band. See
+    /// [`BandConfig`].
+    pub fn banded(alignment_type: AlignmentType, scoring: Scoring, band: BandConfig) -> SimdEngine {
+        let mut engine = SimdEngine::new(alignment_type, scoring);
+        engine.band = Some(band);
+        engine
     }
 
     /// Returns disjoint `&mut` handles to the row-major scratch and the SSE4.1 striped buffers
@@ -432,6 +451,10 @@ impl SimdEngine {
 /// Only reached after the caller's runtime feature check (`is_x86_feature_detected!("sse4.1")` for
 /// [`Isa::Sse41`], `is_aarch64_feature_detected!("neon")` for [`Isa::Neon`]) selected an ISA whose
 /// `target_feature` code inside `S` is therefore sound (see each backend's module Safety note).
+///
+/// `band = Some(..)` activates the banded fill and its `is_banded && max_score == NEG_INF`
+/// Global/Overlap sentinel guard (a banded run that reaches no valid end-to-end endpoint collapses
+/// to an empty alignment); `None` reproduces the exact full-matrix path.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn align_simd_linear<S>(
@@ -441,6 +464,7 @@ fn align_simd_linear<S>(
     graph: &Graph,
     seeded: &mut ScalarInit,
     striped: &mut StripedBuffers<S::Vec>,
+    band: Option<&mut BandState>,
 ) -> (Alignment, i32)
 where
     S: lanes::Simd,
@@ -461,6 +485,7 @@ where
         striped.cached_elem_width = elem_width;
     }
 
+    let is_banded = band.is_some();
     let (max_i, max_j, max_score) = fill::fill_linear::<S>(
         graph,
         seq.len(),
@@ -471,7 +496,19 @@ where
         &striped.masks,
         &striped.penalties,
         &mut striped.h,
+        band,
     );
+
+    // Band-aware Global/Overlap sentinel guard (design §Fill clip Global fix, MAJOR 5). When
+    // banding leaves no sink with a reachable end-to-end (Global) / overlap (Overlap) endpoint,
+    // `fill_*` returns `max_score == NEG_INF` per its "column L or sentinel" rule. Short-circuit to
+    // the empty alignment the backtrack's `(0, 0)` path already yields, WITHOUT running the
+    // backtrack — whose `debug_assert h.get == max_score` would pass vacuously on the sentinel and
+    // then walk into out-of-band cells. No-op on the unbanded path: exact Global always reaches
+    // column L and Local seeds `max_score = 0`, so `max_score` is never NEG_INF there.
+    if is_banded && max_score == NEG_INF {
+        return (Alignment::new(), NEG_INF);
+    }
 
     // Prototype (option 1): skip the destripe; read the striped H directly via `StripedView`.
     let matrix_width_vecs = seq.len().div_ceil(S::LANES);
@@ -511,6 +548,10 @@ where
 ///
 /// Only reached after the caller's runtime ISA feature check selected an ISA whose `target_feature`
 /// code inside `S` is therefore sound (see [`align_simd_linear`]).
+///
+/// `band = Some(..)` activates the banded fill and its `is_banded && max_score == NEG_INF`
+/// Global/Overlap sentinel guard (a banded run that reaches no valid end-to-end endpoint collapses
+/// to an empty alignment); `None` reproduces the exact full-matrix path.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn align_simd_affine<S>(
@@ -520,6 +561,7 @@ fn align_simd_affine<S>(
     graph: &Graph,
     seeded: &mut ScalarInit,
     striped: &mut StripedBuffers<S::Vec>,
+    band: Option<&mut BandState>,
 ) -> (Alignment, i32)
 where
     S: lanes::Simd,
@@ -539,6 +581,7 @@ where
         striped.cached_elem_width = elem_width;
     }
 
+    let is_banded = band.is_some();
     let (max_i, max_j, max_score) = fill::fill_affine::<S>(
         graph,
         seq.len(),
@@ -551,7 +594,13 @@ where
         &mut striped.h,
         &mut striped.e,
         &mut striped.f,
+        band,
     );
+
+    // Band-aware Global/Overlap sentinel guard — see `align_simd_linear` for the full rationale.
+    if is_banded && max_score == NEG_INF {
+        return (Alignment::new(), NEG_INF);
+    }
 
     // Prototype (option 1): skip the destripe; read the striped H/E/F directly via `StripedView`.
     let matrix_width_vecs = seq.len().div_ceil(S::LANES);
@@ -649,6 +698,10 @@ where
 ///
 /// Only reached after the caller's runtime ISA feature check selected an ISA whose `target_feature`
 /// code inside `S` is therefore sound (see [`align_simd_linear`]).
+///
+/// `band = Some(..)` activates the banded fill and its `is_banded && max_score == NEG_INF`
+/// Global/Overlap sentinel guard (a banded run that reaches no valid end-to-end endpoint collapses
+/// to an empty alignment); `None` reproduces the exact full-matrix path.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn align_simd_convex<S>(
@@ -658,6 +711,7 @@ fn align_simd_convex<S>(
     graph: &Graph,
     seeded: &mut ScalarInit,
     striped: &mut StripedBuffers<S::Vec>,
+    band: Option<&mut BandState>,
 ) -> (Alignment, i32)
 where
     S: lanes::Simd,
@@ -679,6 +733,7 @@ where
         striped.cached_elem_width = elem_width;
     }
 
+    let is_banded = band.is_some();
     let (max_i, max_j, max_score) = fill::fill_convex::<S>(
         graph,
         seq.len(),
@@ -694,7 +749,13 @@ where
         &mut striped.f,
         &mut striped.o,
         &mut striped.q,
+        band,
     );
+
+    // Band-aware Global/Overlap sentinel guard — see `align_simd_linear` for the full rationale.
+    if is_banded && max_score == NEG_INF {
+        return (Alignment::new(), NEG_INF);
+    }
 
     // Prototype (option 1): skip the full-matrix destripe. Row 0 / column 0 are already the
     // scalar boundary in the seeded buffers (`reseed_scalar_buffers`); the interior stays striped
@@ -785,12 +846,13 @@ macro_rules! define_simd_runners {
             graph: &Graph,
             seeded: &mut ScalarInit,
             striped: &mut StripedBuffers<S::Vec>,
+            band: Option<&mut BandState>,
         ) -> (Alignment, i32)
         where
             S: lanes::Simd,
             S::Elem: profile::ElemFromI32 + profile::ElemToI32,
         {
-            align_simd_linear::<S>(alignment_type, scoring, seq, graph, seeded, striped)
+            align_simd_linear::<S>(alignment_type, scoring, seq, graph, seeded, striped, band)
         }
 
         #[cfg(target_arch = $arch)]
@@ -802,12 +864,13 @@ macro_rules! define_simd_runners {
             graph: &Graph,
             seeded: &mut ScalarInit,
             striped: &mut StripedBuffers<S::Vec>,
+            band: Option<&mut BandState>,
         ) -> (Alignment, i32)
         where
             S: lanes::Simd,
             S::Elem: profile::ElemFromI32 + profile::ElemToI32,
         {
-            align_simd_affine::<S>(alignment_type, scoring, seq, graph, seeded, striped)
+            align_simd_affine::<S>(alignment_type, scoring, seq, graph, seeded, striped, band)
         }
 
         #[cfg(target_arch = $arch)]
@@ -819,12 +882,13 @@ macro_rules! define_simd_runners {
             graph: &Graph,
             seeded: &mut ScalarInit,
             striped: &mut StripedBuffers<S::Vec>,
+            band: Option<&mut BandState>,
         ) -> (Alignment, i32)
         where
             S: lanes::Simd,
             S::Elem: profile::ElemFromI32 + profile::ElemToI32,
         {
-            align_simd_convex::<S>(alignment_type, scoring, seq, graph, seeded, striped)
+            align_simd_convex::<S>(alignment_type, scoring, seq, graph, seeded, striped, band)
         }
     };
 }
@@ -883,8 +947,27 @@ impl AlignmentEngine for SimdEngine {
         let alignment_type = self.alignment_type;
         let scoring = self.scoring;
 
+        // Build the per-call band once (if this is a banded engine) and thread `as_mut()` into the
+        // single tier×ISA×gap-mode arm that `escalate`/`detect_isa` selected below. `escalate` is
+        // static (one tier picked up front, no runtime int16→int32 retry), so exactly one `run_*`
+        // call site executes per `align`; `Option::as_mut` reborrows, so it is fine that every arm
+        // names `band_state.as_mut()` — only the taken arm evaluates it, and `band_state` outlives
+        // the whole `match`. The rank map is built from the graph's always-current `rank_to_node`
+        // (NOT `self.scratch.node_id_to_rank`, which is not seeded until inside the runner and is
+        // stale here); it is exactly the inverse ranking the fills index `BandState` by via
+        // `seeded.node_id_to_rank`, since both derive from the same topological order.
+        let mut band_state = self.band.map(|cfg| {
+            let mut node_id_to_rank = vec![0u32; graph.nodes.len()];
+            for (rank, &nid) in graph.rank_to_node.iter().enumerate() {
+                node_id_to_rank[nid.0 as usize] = rank as u32;
+            }
+            BandState::new(graph, &node_id_to_rank, seq.len(), cfg)
+        });
+
         match escalation {
-            // Worst case overflows even i32: no vectorized kernel is safe at any ISA.
+            // Worst case overflows even i32: no vectorized kernel is safe at any ISA. Note: when
+            // `self.band` is `Some`, this silently returns the EXACT (unbanded) `SisdEngine` result
+            // instead of a banded one — safe because exact >= banded (never wrong, just not sped up).
             Escalation::Fallback => self.inner.align(seq, graph),
             Escalation::Int32 => match isa {
                 Isa::Avx2 => {
@@ -908,6 +991,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                             GapMode::Affine => unsafe {
@@ -918,6 +1002,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                             GapMode::Convex => unsafe {
@@ -928,6 +1013,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                         }
@@ -959,6 +1045,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                             GapMode::Affine => unsafe {
@@ -969,6 +1056,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                             GapMode::Convex => unsafe {
@@ -979,6 +1067,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                         }
@@ -1008,6 +1097,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                             GapMode::Affine => unsafe {
@@ -1018,6 +1108,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                             GapMode::Convex => unsafe {
@@ -1028,6 +1119,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                         }
@@ -1037,6 +1129,10 @@ impl AlignmentEngine for SimdEngine {
                         self.inner.align(seq, graph)
                     }
                 }
+                // No usable vectorized ISA on this host: delegate to the scalar `SisdEngine`. Note:
+                // when `self.band` is `Some`, this silently returns the EXACT (unbanded) result
+                // instead of a banded one — safe because exact >= banded (never wrong, just not
+                // sped up).
                 Isa::None => self.inner.align(seq, graph),
             },
             Escalation::Int16 => match isa {
@@ -1061,6 +1157,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                             GapMode::Affine => unsafe {
@@ -1071,6 +1168,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                             GapMode::Convex => unsafe {
@@ -1081,6 +1179,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                         }
@@ -1111,6 +1210,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                             GapMode::Affine => unsafe {
@@ -1121,6 +1221,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                             GapMode::Convex => unsafe {
@@ -1131,6 +1232,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                         }
@@ -1160,6 +1262,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                             GapMode::Affine => unsafe {
@@ -1170,6 +1273,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                             GapMode::Convex => unsafe {
@@ -1180,6 +1284,7 @@ impl AlignmentEngine for SimdEngine {
                                     graph,
                                     scratch,
                                     striped,
+                                    band_state.as_mut(),
                                 )
                             },
                         }
@@ -1189,6 +1294,10 @@ impl AlignmentEngine for SimdEngine {
                         self.inner.align(seq, graph)
                     }
                 }
+                // No usable vectorized ISA on this host: delegate to the scalar `SisdEngine`. Note:
+                // when `self.band` is `Some`, this silently returns the EXACT (unbanded) result
+                // instead of a banded one — safe because exact >= banded (never wrong, just not
+                // sped up).
                 Isa::None => self.inner.align(seq, graph),
             },
         }
@@ -1364,5 +1473,153 @@ mod tests {
         assert!(!should_force_sse41(Some("avx2")));
         assert!(!should_force_sse41(Some("sse4.1")));
         assert!(!should_force_sse41(Some("neon")));
+    }
+
+    /// Task 9 — the `align_simd_*` band guard. When the banded fill finds no reachable Global
+    /// endpoint (`max_score == NEG_INF`), the pipeline must short-circuit to an empty alignment +
+    /// `NEG_INF` WITHOUT running the backtrack (whose `debug_assert h.get == max_score` would pass
+    /// vacuously on the sentinel, then walk into out-of-band cells). `align`'s public path does not
+    /// yet plumb a band (it always passes `None`), so the guard is validated at the
+    /// `align_simd_linear` entry point with the same hand-built all-out-of-band band as the fill
+    /// test `banded_global_returns_sentinel_when_column_l_out_of_band`.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn banded_global_guard_returns_empty_alignment_and_neg_inf() {
+        #[cfg(target_arch = "aarch64")]
+        type TestSimd = crate::align::simd::neon::NeonI16;
+        #[cfg(target_arch = "x86_64")]
+        type TestSimd = crate::align::simd::sse41::Sse41I16;
+
+        let seq = b"ACGTTGCAGATCCGTAAGCTTACGGATCAGTTCAGGATCACGTTGCAA";
+        let scoring = Scoring::new(5, -4, -8, -6, -10, -4).unwrap();
+        // A short (4-node) graph against the long query keeps the adaptive band near the left edge,
+        // so no sink reaches column L (mirrors the fill test of the same name).
+        let graph = linear_graph(b"ACGT");
+        let n = graph.num_nodes();
+
+        let mut seeded = ScalarInit::default();
+        let mut striped =
+            StripedBuffers::<<TestSimd as crate::align::simd::lanes::Simd>::Vec>::default();
+        // anchor = L - R = 0 for every node: no sink reaches column L, so the fill returns NEG_INF.
+        let mut band = BandState {
+            r: vec![seq.len() as u32; n],
+            best_col: vec![0; n],
+            w: 1,
+        };
+
+        let (alignment, score) = align_simd_linear::<TestSimd>(
+            AlignmentType::Global,
+            scoring,
+            seq,
+            &graph,
+            &mut seeded,
+            &mut striped,
+            Some(&mut band),
+        );
+
+        assert!(
+            alignment.is_empty(),
+            "guard must return the empty alignment"
+        );
+        assert_eq!(
+            score, NEG_INF,
+            "guard must return the NEG_INF sentinel score"
+        );
+    }
+
+    /// Task 10 (Gate B) — end-to-end proof that `SimdEngine::banded` + the `align()` band dispatch
+    /// are wired correctly: over a small family of near-identical reads with the default band, the
+    /// banded engine reproduces the exact (`SimdEngine::new`) engine's `(Alignment, score)` for
+    /// every read. No near-identical read needs an out-of-band indel, so the in-band optimum equals
+    /// the exact optimum. Uses the consumer's convex scoring (`Scoring::spoa_default`).
+    #[test]
+    fn banded_engine_matches_exact_on_near_identical_family() {
+        let alignment_type = AlignmentType::Global;
+        let scoring = Scoring::spoa_default(); // convex — the consumer's path
+        let family: [&[u8]; 4] = [
+            b"ACGTACGTACGTACGTACGT",
+            b"ACGTACGTATGTACGTACGT", // one substitution
+            b"ACGTACGTACGTACCTACGT", // one substitution
+            b"ACGTACGAACGTACGTACGT", // one substitution
+        ];
+
+        // Build the shared graph once with an exact engine.
+        let mut graph = Graph::new();
+        let mut builder = SimdEngine::new(alignment_type, scoring);
+        for read in family {
+            crate::align::align_and_add(&mut graph, &mut builder, read, 1).unwrap();
+        }
+
+        let mut exact = SimdEngine::new(alignment_type, scoring);
+        let mut banded = SimdEngine::banded(alignment_type, scoring, BandConfig::default());
+        for read in family {
+            assert_eq!(
+                banded.align(read, &graph),
+                exact.align(read, &graph),
+                "banded must equal exact for in-band near-identical read {read:?}"
+            );
+        }
+    }
+
+    /// Task 10 (Gate B) — pins the documented heuristic contract: a query with an indel run WIDER
+    /// than a tiny band (`base = 2, frac = 0.0`) is missed by the banded engine (its score differs
+    /// from — and is no better than — the exact score), yet the banded engine still returns a
+    /// STRUCTURALLY VALID alignment (no panic, every emitted node/query index is `-1` or in range).
+    ///
+    /// The band's *effective* computed region is quantized to `LANES`-wide segments
+    /// (`[beg_sn * LANES, end_sn * LANES)`), so a band that is narrow in query columns still rounds
+    /// out to at least one full segment — up to 16 columns on AVX2's 16-lane int16 tier (vs 8 on
+    /// SSE4.1/NEON). To make the "must miss" premise hold on EVERY ISA (not just narrow-lane ones),
+    /// the fixture uses a long backbone and an insertion (48 bp) far larger than the widest possible
+    /// segment-quantized band, and long enough that the node-count anchor is badly off-diagonal for
+    /// the surrounding backbone — so the tiny band cannot reach the wide-gap optimum regardless of
+    /// lane width. (An earlier 20 bp / 12 bp fixture passed on 8-lane ISAs but spuriously *equalled*
+    /// exact on 16-lane AVX2, where a w=2 band rounds out to ~the whole short matrix.)
+    #[test]
+    fn banded_engine_documents_large_indel_miss() {
+        let alignment_type = AlignmentType::Global;
+        let scoring = Scoring::spoa_default();
+
+        // 120 bp linear backbone.
+        let backbone: Vec<u8> = b"ACGT".iter().cycle().take(120).copied().collect();
+        let graph = linear_graph(&backbone);
+
+        // Same backbone with a 48 bp non-backbone run inserted at the midpoint — far wider than any
+        // LANES-quantized `w = 2` band (<= ~16 columns even on AVX2), so the wide-gap optimum is
+        // unreachable in-band on every ISA.
+        let insertion = b"GGCCGGCCGGCCGGCCGGCCGGCCGGCCGGCCGGCCGGCCGGCCGGCC"; // 48 bp
+        let mut query = Vec::with_capacity(backbone.len() + insertion.len());
+        query.extend_from_slice(&backbone[..60]);
+        query.extend_from_slice(insertion);
+        query.extend_from_slice(&backbone[60..]);
+
+        let mut exact = SimdEngine::new(alignment_type, scoring);
+        let mut banded =
+            SimdEngine::banded(alignment_type, scoring, BandConfig { base: 2, frac: 0.0 });
+
+        let (_exact_alignment, exact_score) = exact.align(&query, &graph);
+        let (banded_alignment, banded_score) = banded.align(&query, &graph);
+
+        // The tiny band cannot represent the wide indel, so it cannot reach the exact optimum.
+        assert_ne!(
+            banded_score, exact_score,
+            "a w=2 band must miss the wide-indel optimum (documented heuristic miss)"
+        );
+        assert!(
+            banded_score <= exact_score,
+            "a banded search is a subset of the exact search, so it can never beat it"
+        );
+
+        // ...but the returned alignment must still be structurally valid (no garbage indices).
+        for &(node_idx, query_idx) in &banded_alignment {
+            assert!(
+                node_idx == -1 || (node_idx >= 0 && (node_idx as usize) < graph.num_nodes()),
+                "node index {node_idx} out of range"
+            );
+            assert!(
+                query_idx == -1 || (query_idx >= 0 && (query_idx as usize) < query.len()),
+                "query index {query_idx} out of range"
+            );
+        }
     }
 }

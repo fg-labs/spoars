@@ -67,6 +67,15 @@ pub(crate) trait Simd {
     /// (`impl:72,108,166,201`); see [`Simd::add`] for why this must not saturate.
     fn sub(a: Self::Vec, b: Self::Vec) -> Self::Vec;
 
+    /// Lane-wise **saturating** addition — clamps at the element bound instead of wrapping.
+    /// Required by the banded fill: interior out-of-band `NEG_INF` sentinels can be penalized
+    /// across many rows, and a wrapping add would eventually flip a sentinel positive and win a
+    /// `max()`. The exact (non-banded) path never uses this (it relies on the +1024 headroom).
+    fn adds(a: Self::Vec, b: Self::Vec) -> Self::Vec;
+
+    /// Lane-wise **saturating** subtraction; see [`Simd::adds`].
+    fn subs(a: Self::Vec, b: Self::Vec) -> Self::Vec;
+
     /// Lane-wise signed minimum. Ports `_mmxxx_min_epi` (`impl:75,111,169,204`).
     fn min(a: Self::Vec, b: Self::Vec) -> Self::Vec;
 
@@ -220,6 +229,16 @@ impl Simd for ScalarSimdI16 {
     }
 
     #[inline(always)]
+    fn adds(a: i16, b: i16) -> i16 {
+        a.saturating_add(b)
+    }
+
+    #[inline(always)]
+    fn subs(a: i16, b: i16) -> i16 {
+        a.saturating_sub(b)
+    }
+
+    #[inline(always)]
     fn min(a: i16, b: i16) -> i16 {
         a.min(b)
     }
@@ -326,6 +345,16 @@ impl Simd for ScalarSimdI32 {
     }
 
     #[inline(always)]
+    fn adds(a: i32, b: i32) -> i32 {
+        a.saturating_add(b)
+    }
+
+    #[inline(always)]
+    fn subs(a: i32, b: i32) -> i32 {
+        a.saturating_sub(b)
+    }
+
+    #[inline(always)]
     fn min(a: i32, b: i32) -> i32 {
         a.min(b)
     }
@@ -426,6 +455,17 @@ mod tests {
     }
 
     #[test]
+    fn i16_saturating_add_sub_clamp_at_bounds() {
+        // adds/subs must clamp, unlike add/sub which wrap.
+        assert_eq!(ScalarSimdI16::adds(i16::MAX, 1), i16::MAX);
+        assert_eq!(ScalarSimdI16::subs(i16::MIN, 1), i16::MIN);
+        // NEG_INF + a large negative penalty must stay clamped, never wrap positive.
+        let neg = ScalarSimdI16::NEG_INF;
+        assert_eq!(ScalarSimdI16::adds(neg, -128), neg.saturating_add(-128));
+        assert!(ScalarSimdI16::adds(neg, -128) < 0); // the property the band relies on
+    }
+
+    #[test]
     fn i16_horizontal_max_seeds_at_zero_not_elem_min() {
         // The Smith-Waterman clamp: a negative single lane still reduces to 0, not the lane's
         // own (negative) value and not `Elem::MIN`.
@@ -476,6 +516,19 @@ mod tests {
     fn i32_add_sub_are_non_saturating() {
         assert_eq!(ScalarSimdI32::add(i32::MAX, 1), i32::MIN);
         assert_eq!(ScalarSimdI32::sub(i32::MIN, 1), i32::MAX);
+    }
+
+    #[test]
+    fn i32_saturating_add_sub_clamp_at_bounds() {
+        assert_eq!(ScalarSimdI32::adds(i32::MAX, 1), i32::MAX);
+        assert_eq!(ScalarSimdI32::subs(i32::MIN, 1), i32::MIN);
+        let neg = ScalarSimdI32::NEG_INF;
+        // 9 successive -128 adds must not wrap the int32 sentinel positive.
+        let mut v = neg;
+        for _ in 0..9 {
+            v = ScalarSimdI32::adds(v, -128);
+        }
+        assert!(v < 0);
     }
 
     #[test]

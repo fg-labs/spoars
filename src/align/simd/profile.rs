@@ -355,6 +355,22 @@ mod tests {
             TestVec4(out)
         }
 
+        fn adds(a: TestVec4, b: TestVec4) -> TestVec4 {
+            let mut out = [0i32; 4];
+            for (o, (x, y)) in out.iter_mut().zip(a.0.iter().zip(b.0.iter())) {
+                *o = x.saturating_add(*y);
+            }
+            TestVec4(out)
+        }
+
+        fn subs(a: TestVec4, b: TestVec4) -> TestVec4 {
+            let mut out = [0i32; 4];
+            for (o, (x, y)) in out.iter_mut().zip(a.0.iter().zip(b.0.iter())) {
+                *o = x.saturating_sub(*y);
+            }
+            TestVec4(out)
+        }
+
         fn min(a: TestVec4, b: TestVec4) -> TestVec4 {
             let mut out = [0i32; 4];
             for (o, (x, y)) in out.iter_mut().zip(a.0.iter().zip(b.0.iter())) {
