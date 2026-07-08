@@ -312,3 +312,35 @@ def test_inspection_accessors_reject_out_of_range() -> None:
             call()
     with pytest.raises(ValueError):
         g.encode("AC")  # not a single character
+
+
+def test_edges_match_node_count_and_connect_valid_nodes() -> None:
+    g = spoars.poa(["ACGTACGT", "ACGAACGT", "ACGTAAGT"])
+    n = g.num_nodes()
+    edges = g.edges()
+    assert len(edges) == g.num_edges()
+    for tail, head, weight in edges:
+        assert 0 <= tail < n
+        assert 0 <= head < n
+        assert weight >= 1
+
+
+def test_msa_columns_and_members_are_consistent() -> None:
+    reads = ["ACGTACGT", "ACGAACGT", "ACGTAAGT"]
+    g = spoars.poa(reads)
+    col_of_node, num_cols = g.msa_columns()
+    assert len(col_of_node) == g.num_nodes()
+    assert all(0 <= c < num_cols for c in col_of_node)
+    members = g.column_members()
+    assert len(members) == num_cols
+    # The MSA has one row per sequence, num_cols wide; column_members places each
+    # node in its column, and each (seq, node) there sits at that column.
+    for col_index, col in enumerate(members):
+        for seq_index, node in col:
+            assert 0 <= seq_index < len(reads)
+            assert col_of_node[node] == col_index
+    # Every node appears in exactly the columns its sequences traverse: the total
+    # membership count equals the total path length across all sequences.
+    total_members = sum(len(col) for col in members)
+    total_path = sum(len(g.sequence_path(i)) for i in range(len(reads)))
+    assert total_members == total_path

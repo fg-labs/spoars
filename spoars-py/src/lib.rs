@@ -435,6 +435,31 @@ impl Poa {
         self.check_node(node_id)?;
         Ok(self.graph.node(NodeId(node_id)).labels(&self.graph))
     }
+
+    // ---- Edge + MSA-column accessors --------------------------------------------------
+
+    /// Every edge as ``(tail, head, weight)``, in edge-arena order.
+    fn edges(&self) -> Vec<(u32, u32, i64)> {
+        self.graph
+            .edges()
+            .iter()
+            .map(|e| (e.tail.0, e.head.0, e.weight))
+            .collect()
+    }
+
+    /// For each node id, the MSA column it occupies, plus the total column count.
+    fn msa_columns(&self) -> (Vec<u32>, u32) {
+        self.graph.msa_columns()
+    }
+
+    /// One entry per MSA column: the ``(sequence_index, node_id)`` pairs in that column.
+    fn column_members(&self) -> Vec<Vec<(u32, u32)>> {
+        self.graph
+            .column_members()
+            .into_iter()
+            .map(|col| col.into_iter().map(|(seq, node)| (seq, node.0)).collect())
+            .collect()
+    }
 }
 
 impl Poa {
