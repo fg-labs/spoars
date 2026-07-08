@@ -1,3 +1,5 @@
+import pickle
+
 import pytest
 import spoars
 
@@ -171,3 +173,27 @@ def test_consensus_composition_on_empty_poa_is_empty() -> None:
     cons, matrix = g.consensus_composition()
     assert cons == ""
     assert matrix == []
+
+
+def test_json_round_trip_preserves_consensus_msa_gfa() -> None:
+    g = spoars.poa(["ACGTACGT", "ACGAACGT", "ACGTAAGT"])
+    restored = spoars.Poa.from_json(g.to_json())
+    assert restored.consensus() == g.consensus()
+    assert restored.msa() == g.msa()
+    assert restored.gfa() == g.gfa()
+    assert restored.num_nodes() == g.num_nodes()
+
+
+def test_pickle_round_trip_preserves_graph_and_stays_functional() -> None:
+    g = spoars.Poa(alignment_type="global", scoring=spoars.Scoring.default())
+    for read in ["ACGTACGT", "ACGAACGT", "ACGTAAGT"]:
+        g.add(read)
+    restored = pickle.loads(pickle.dumps(g))
+    assert restored.consensus() == g.consensus()
+    assert restored.msa() == g.msa()
+    assert restored.gfa() == g.gfa()
+    # A restored Poa is fully functional: its engine (alignment type + scoring) survived,
+    # so further reads align the same way.
+    restored.add("ACGTACGT")
+    g.add("ACGTACGT")
+    assert restored.consensus() == g.consensus()
