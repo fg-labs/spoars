@@ -151,6 +151,11 @@ pub struct Edge {
 ///
 /// Mirrors `spoa::Graph` (`graph.hpp:25-320`), replacing its `unique_ptr<Node>` / raw `Node*`
 /// pointer graph with flat `Vec<Node>` / `Vec<Edge>` arenas indexed by [`NodeId`] / [`EdgeId`].
+///
+/// When the `serde` feature is enabled, `Graph` derives `Serialize`/`Deserialize` as a
+/// structural dump; deserialization trusts its input — arena indices and table lengths are
+/// not re-validated, so a malformed payload may panic when the graph is later used. Only
+/// deserialize graphs from a trusted source.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Graph {

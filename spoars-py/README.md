@@ -31,6 +31,11 @@ print(g.dot())  # Graphviz DOT
 # Consensus with per-base total coverage, or the per-column base composition:
 consensus, coverage = g.consensus(with_coverage=True)  # (str, list[int])
 consensus, matrix = g.consensus_composition()  # rows = codes + a trailing gap row
+# Cache or transmit a graph — pickle, or JSON via to_json / from_json:
+import pickle
+
+restored = pickle.loads(pickle.dumps(g))
+restored = spoars.Poa.from_json(g.to_json())
 ```
 
 `alignment_type` is one of `"global"`, `"local"`, or `"overlap"`. `Scoring` takes

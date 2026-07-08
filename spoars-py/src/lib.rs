@@ -297,6 +297,9 @@ impl Poa {
     }
 
     /// Rebuild a `Poa` from a JSON string produced by :meth:`to_json`.
+    ///
+    /// Assumes `data` was produced by `to_json` on a trusted source; malformed input may raise
+    /// or, if structurally corrupt, panic on later use.
     #[staticmethod]
     fn from_json(data: &str) -> PyResult<Self> {
         #[derive(serde::Deserialize)]
