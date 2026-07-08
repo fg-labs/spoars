@@ -542,6 +542,10 @@ OracleCase ParseCase(const JsonValue& v) {
 
   if (v.Has("subgraph") && !v.At("subgraph").IsNull()) {
     const JsonValue& sg = v.At("subgraph");
+    if (sg.array.size() != 2) {
+      throw std::runtime_error(
+          "[spoa_oracle] subgraph must be a 2-element [begin, end] array");
+    }
     result.has_subgraph = true;
     result.subgraph_begin = static_cast<std::uint32_t>(sg.array[0].AsInt());
     result.subgraph_end = static_cast<std::uint32_t>(sg.array[1].AsInt());

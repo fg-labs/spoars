@@ -331,7 +331,7 @@ impl Graph {
     ///
     /// Returns the subgraph and a `Vec` indexed by the subgraph's `NodeId.0`, giving the
     /// corresponding `NodeId` in `self`. Mirrors `spoa::Graph::Subgraph` (`graph.cpp:574-628`),
-    /// which internally calls `ExtractSubgraph(nodes_[end], nodes_[begin])` (`graph.cpp:551-571`).
+    /// which internally calls `ExtractSubgraph(nodes_[end], nodes_[begin])` (`graph.cpp:551-572`).
     ///
     /// Node selection walks **backwards** from `end` over in-edges and aligned nodes, keeping any
     /// node whose id is `>= begin`. `num_codes` / `coder` / `decoder` are copied; in-edges are
@@ -341,7 +341,10 @@ impl Graph {
     /// connected node reports `coverage() == 1`; this matches spoa exactly.
     ///
     /// # Panics
-    /// Panics if `begin` or `end` is out of range (mirrors spoa indexing `nodes_[...]`).
+    /// Panics if `end` is out of range: it indexes `self.nodes` (and the `is_in_subgraph`
+    /// mask). `begin` is never used to index — it only appears in a `>=` comparison — so a
+    /// `begin` past the end of the graph does not panic; it simply yields an empty (or
+    /// partial) subgraph.
     pub fn subgraph(&self, begin: NodeId, end: NodeId) -> (Graph, Vec<NodeId>) {
         // ExtractSubgraph: stack-DFS backwards from `end`, keeping nodes with id >= begin.
         let mut is_in_subgraph = vec![false; self.nodes.len()];
@@ -1792,7 +1795,7 @@ mod tests {
 
     /// A tiny hand-built graph: linear A->C->G->T (node ids 0..=3), no aligned peers.
     /// Extracting the window [1, 2] keeps nodes with id in {1, 2} reachable walking
-    /// backwards from node `end`=2: node 2 (C? -> keep), its in-edge tail node 1, its
+    /// backwards from node `end`=2: node 2 (G -> keep), its in-edge tail node 1, its
     /// aligned peers (none). Node 1's in-edge tail is node 0 (id 0 < begin=1 -> dropped).
     fn linear_graph_acgt() -> Graph {
         let mut g = Graph::new();
@@ -1849,7 +1852,7 @@ mod tests {
         /// parent id `>= begin`, and every subgraph edge connects two kept nodes.
         ///
         /// Note there is no corresponding `<= end` upper bound to assert: `ExtractSubgraph`
-        /// (`graph.cpp:551-561`) walks backwards from `end` over both in-edges *and* aligned-node
+        /// (`graph.cpp:551-572`) walks backwards from `end` over both in-edges *and* aligned-node
         /// cross-links, and aligned peers are not id-ordered (a mismatch column links a low-id
         /// node to the higher-id node created for the divergent base — see
         /// `topological_sort_ranks_every_node_including_aligned_groups` above for exactly this
