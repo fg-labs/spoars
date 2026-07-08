@@ -494,6 +494,9 @@ struct OracleCase {
   std::int32_t min_coverage = -1;
   bool has_names = false;
   std::vector<std::string> names;
+  bool has_subgraph = false;
+  std::uint32_t subgraph_begin = 0;
+  std::uint32_t subgraph_end = 0;
 };
 
 OracleCase ParseCase(const JsonValue& v) {
@@ -537,6 +540,13 @@ OracleCase ParseCase(const JsonValue& v) {
     }
   }
 
+  if (v.Has("subgraph") && !v.At("subgraph").IsNull()) {
+    const JsonValue& sg = v.At("subgraph");
+    result.has_subgraph = true;
+    result.subgraph_begin = static_cast<std::uint32_t>(sg.array[0].AsInt());
+    result.subgraph_end = static_cast<std::uint32_t>(sg.array[1].AsInt());
+  }
+
   return result;
 }
 
@@ -577,6 +587,48 @@ void RunCase(const OracleCase& oc, std::ostream& out) {
   std::string gfa = PrintGfaToString(graph, headers);
   std::string dot = PrintDotToString(graph);
 
+  std::string subgraph_json;
+  if (oc.has_subgraph) {
+    std::vector<const spoa::Graph::Node*> map;
+    spoa::Graph subgraph = graph.Subgraph(oc.subgraph_begin, oc.subgraph_end, &map);
+
+    std::ostringstream sg;
+    sg << ",\"subgraph\":{";
+    // map: parent graph id per subgraph node id (only the first num_nodes entries are set).
+    sg << "\"map\":[";
+    for (std::size_t i = 0; i < subgraph.nodes().size(); ++i) {
+      if (i != 0) sg << ",";
+      sg << map[i]->id;
+    }
+    sg << "],\"codes\":[";
+    for (std::size_t i = 0; i < subgraph.nodes().size(); ++i) {
+      if (i != 0) sg << ",";
+      sg << subgraph.nodes()[i]->code;
+    }
+    sg << "],\"edges\":[";
+    for (std::size_t i = 0; i < subgraph.edges().size(); ++i) {
+      if (i != 0) sg << ",";
+      const auto& e = subgraph.edges()[i];
+      sg << "[" << e->tail->id << "," << e->head->id << "," << e->weight << "]";
+    }
+    sg << "],\"rank\":[";
+    for (std::size_t i = 0; i < subgraph.rank_to_node().size(); ++i) {
+      if (i != 0) sg << ",";
+      sg << subgraph.rank_to_node()[i]->id;
+    }
+    sg << "],\"aligned\":[";
+    bool first_aligned = true;
+    for (const auto& n : subgraph.nodes()) {
+      for (const auto& a : n->aligned_nodes) {
+        if (!first_aligned) sg << ",";
+        first_aligned = false;
+        sg << "[" << n->id << "," << a->id << "]";
+      }
+    }
+    sg << "]}";
+    subgraph_json = sg.str();
+  }
+
   out << "{\"id\":" << oc.id << ",\"alignments\":[";
   for (std::size_t i = 0; i < alignments.size(); ++i) {
     if (i != 0) {
@@ -600,7 +652,7 @@ void RunCase(const OracleCase& oc, std::ostream& out) {
     out << "\"" << JsonEscape(msa[i]) << "\"";
   }
   out << "],\"gfa\":\"" << JsonEscape(gfa) << "\",\"dot\":\""
-      << JsonEscape(dot) << "\"}\n";
+      << JsonEscape(dot) << "\"" << subgraph_json << "}\n";
   out.flush();
 }
 
