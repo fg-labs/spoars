@@ -70,6 +70,14 @@ pub struct OracleCase {
     /// entirely rather than serialized as `null`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subgraph: Option<(u32, u32)>,
+    /// When `true`, the oracle additionally emits `consensus_coverage` (from
+    /// `Graph::GenerateConsensus(min_coverage, &cov)`) and `consensus_composition`
+    /// (from `Graph::GenerateConsensus(&comp, true)`, i.e. over the *unfiltered*
+    /// consensus regardless of `min_coverage`). Skipped when `false` (the default)
+    /// so requests that don't need the summary are byte-identical to before this
+    /// field existed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub summarize_consensus: bool,
 }
 
 /// Monotonic source of default `OracleCase` ids. `defaulted` draws from this
@@ -100,6 +108,7 @@ impl OracleCase {
             min_coverage: DEFAULT_MIN_COVERAGE,
             names: None,
             subgraph: None,
+            summarize_consensus: false,
         }
     }
 
@@ -203,10 +212,23 @@ struct SubgraphOut {
     aligned: Vec<(u32, u32)>,
 }
 
-/// Raw wire shape of a JSONL result line: identical to [`OracleResult`] except the
-/// `subgraph_*` fields are still nested under a single optional `"subgraph"` key, matching
-/// what `oracle/spoa_oracle.cpp` actually emits. Exists only so `#[serde(from = ...)]` can
-/// flatten it into [`OracleResult`] without hand-rolling a `Deserialize` impl.
+/// The nested `"consensus_composition":{"stride":N,"matrix":[...]}` object the
+/// oracle emits when `OracleCase::summarize_consensus` is set. Deserialized
+/// separately from [`OracleResult`] (via [`OracleResultRaw`]) and then
+/// flattened into it, since the oracle nests these two fields together under
+/// one JSON key but callers want them as sibling fields matching
+/// `Graph::generate_consensus_with_composition`'s `(consensus, matrix, stride)`
+/// return shape.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OracleConsensusComposition {
+    stride: usize,
+    matrix: Vec<u32>,
+}
+
+/// Raw wire shape of a JSONL result line: the flattened [`OracleResult`] fields, but with
+/// `subgraph` and `consensus_composition` still nested under their single JSON keys (matching
+/// what `oracle/spoa_oracle.cpp` emits). Exists only so `#[serde(from = ...)]` can flatten it
+/// into [`OracleResult`] without hand-rolling a `Deserialize` impl.
 #[derive(Debug, Clone, Deserialize)]
 struct OracleResultRaw {
     id: u32,
@@ -217,14 +239,21 @@ struct OracleResultRaw {
     dot: String,
     #[serde(default)]
     subgraph: Option<SubgraphOut>,
+    #[serde(default)]
+    consensus_coverage: Vec<u32>,
+    #[serde(default)]
+    consensus_composition: OracleConsensusComposition,
 }
 
 /// One JSONL result line from the oracle: per-sequence alignment traces
 /// (`(graph_node_id, query_index)` pairs, `-1` marking a gap on either side),
-/// the generated consensus, the multiple sequence alignment, GFA/DOT graph
-/// dumps, and (when the request carried [`OracleCase::subgraph`]) the
-/// `Graph::subgraph` parity fields, flattened from the wire's nested
-/// `"subgraph"` object; empty when the request didn't ask for one.
+/// the generated consensus, the multiple sequence alignment, and GFA/DOT graph dumps.
+///
+/// When the request carried [`OracleCase::subgraph`], the `subgraph_*` fields hold the
+/// `Graph::subgraph` parity data (flattened from the wire's nested `"subgraph"` object);
+/// when it set `summarize_consensus: true`, `consensus_coverage` / `consensus_composition` /
+/// `consensus_composition_stride` hold the consensus-summary parity data. Fields the request
+/// didn't ask for default to empty/zero.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(from = "OracleResultRaw")]
 pub struct OracleResult {
@@ -239,6 +268,16 @@ pub struct OracleResult {
     pub subgraph_edges: Vec<(u32, u32, i64)>,
     pub subgraph_rank: Vec<u32>,
     pub subgraph_aligned: Vec<(u32, u32)>,
+    /// Per-consensus-base read coverage, filtered by the case's `min_coverage`
+    /// (mirrors `Graph::generate_consensus_with_coverage`'s second return value).
+    pub consensus_coverage: Vec<u32>,
+    /// The flat `(num_codes + 1) × consensus_composition_stride` consensus-composition
+    /// matrix, row-major, always computed over the *unfiltered* consensus (mirrors
+    /// `Graph::generate_consensus_with_composition`'s second return value).
+    pub consensus_composition: Vec<u32>,
+    /// `consensus_composition`'s stride, i.e. the unfiltered consensus length
+    /// (mirrors `Graph::generate_consensus_with_composition`'s third return value).
+    pub consensus_composition_stride: usize,
 }
 
 impl From<OracleResultRaw> for OracleResult {
@@ -260,6 +299,9 @@ impl From<OracleResultRaw> for OracleResult {
             subgraph_edges,
             subgraph_rank,
             subgraph_aligned,
+            consensus_coverage: raw.consensus_coverage,
+            consensus_composition: raw.consensus_composition.matrix,
+            consensus_composition_stride: raw.consensus_composition.stride,
         }
     }
 }
