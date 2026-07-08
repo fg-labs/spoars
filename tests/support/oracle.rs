@@ -63,6 +63,13 @@ pub struct OracleCase {
     /// `0..seqs.len()` decimal placeholders; DOT output is unaffected (it labels nodes by id,
     /// not by sequence name).
     pub names: Option<Vec<String>>,
+    /// Optional `(begin, end)` parent-node-id window. When present, the oracle additionally
+    /// calls `spoa::Graph::Subgraph(begin, end, &map)` on the graph it built from `seqs` and
+    /// emits the result as a `"subgraph"` object in [`OracleResult`]; omitted (`None`) when a
+    /// case doesn't exercise `Graph::subgraph`, so the field is skipped in the request JSON
+    /// entirely rather than serialized as `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subgraph: Option<(u32, u32)>,
 }
 
 /// Monotonic source of default `OracleCase` ids. `defaulted` draws from this
@@ -92,6 +99,7 @@ impl OracleCase {
             quals: None,
             min_coverage: DEFAULT_MIN_COVERAGE,
             names: None,
+            subgraph: None,
         }
     }
 
@@ -172,11 +180,53 @@ impl OracleCase {
     }
 }
 
+/// The `"subgraph"` object emitted alongside a result line when the request's
+/// [`OracleCase::subgraph`] was `Some`: the oracle's own `spoa::Graph::Subgraph` output, so
+/// tests can assert `spoars::graph::Graph::subgraph` matches it field-for-field. Deserialized
+/// only as an intermediate — see [`OracleResult`]'s `From` impl, which flattens it (or, when
+/// absent, empty vectors) into the public `subgraph_*` fields.
+#[derive(Debug, Clone, Deserialize)]
+struct SubgraphOut {
+    /// Subgraph node id -> parent-graph node id (the only field expressed in parent-graph ids;
+    /// every other field below is entirely in the subgraph's own local node ids, since spoa's
+    /// `Subgraph` returns a fresh `Graph` with sequentially reassigned ids).
+    map: Vec<u32>,
+    /// Coder code per subgraph node id.
+    codes: Vec<u32>,
+    /// `(tail, head, weight)` per subgraph edge, in edge-arena order; tail/head are subgraph
+    /// node ids.
+    edges: Vec<(u32, u32, i64)>,
+    /// Topological order, as subgraph node ids.
+    rank: Vec<u32>,
+    /// `(node, peer)` aligned-node pairs, one entry per direction (i.e. both `(a, b)` and
+    /// `(b, a)` appear for an aligned pair), as subgraph node ids.
+    aligned: Vec<(u32, u32)>,
+}
+
+/// Raw wire shape of a JSONL result line: identical to [`OracleResult`] except the
+/// `subgraph_*` fields are still nested under a single optional `"subgraph"` key, matching
+/// what `oracle/spoa_oracle.cpp` actually emits. Exists only so `#[serde(from = ...)]` can
+/// flatten it into [`OracleResult`] without hand-rolling a `Deserialize` impl.
+#[derive(Debug, Clone, Deserialize)]
+struct OracleResultRaw {
+    id: u32,
+    alignments: Vec<Vec<(i32, i32)>>,
+    consensus: String,
+    msa: Vec<String>,
+    gfa: String,
+    dot: String,
+    #[serde(default)]
+    subgraph: Option<SubgraphOut>,
+}
+
 /// One JSONL result line from the oracle: per-sequence alignment traces
 /// (`(graph_node_id, query_index)` pairs, `-1` marking a gap on either side),
-/// the generated consensus, the multiple sequence alignment, and GFA/DOT
-/// graph dumps.
+/// the generated consensus, the multiple sequence alignment, GFA/DOT graph
+/// dumps, and (when the request carried [`OracleCase::subgraph`]) the
+/// `Graph::subgraph` parity fields, flattened from the wire's nested
+/// `"subgraph"` object; empty when the request didn't ask for one.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(from = "OracleResultRaw")]
 pub struct OracleResult {
     pub id: u32,
     pub alignments: Vec<Vec<(i32, i32)>>,
@@ -184,6 +234,34 @@ pub struct OracleResult {
     pub msa: Vec<String>,
     pub gfa: String,
     pub dot: String,
+    pub subgraph_map: Vec<u32>,
+    pub subgraph_codes: Vec<u32>,
+    pub subgraph_edges: Vec<(u32, u32, i64)>,
+    pub subgraph_rank: Vec<u32>,
+    pub subgraph_aligned: Vec<(u32, u32)>,
+}
+
+impl From<OracleResultRaw> for OracleResult {
+    fn from(raw: OracleResultRaw) -> Self {
+        let (subgraph_map, subgraph_codes, subgraph_edges, subgraph_rank, subgraph_aligned) =
+            match raw.subgraph {
+                Some(sg) => (sg.map, sg.codes, sg.edges, sg.rank, sg.aligned),
+                None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            };
+        OracleResult {
+            id: raw.id,
+            alignments: raw.alignments,
+            consensus: raw.consensus,
+            msa: raw.msa,
+            gfa: raw.gfa,
+            dot: raw.dot,
+            subgraph_map,
+            subgraph_codes,
+            subgraph_edges,
+            subgraph_rank,
+            subgraph_aligned,
+        }
+    }
 }
 
 /// Locates the crate root regardless of the test binary's working directory.

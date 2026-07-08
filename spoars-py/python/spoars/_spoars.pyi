@@ -57,6 +57,17 @@ class Poa:
     def dot(self) -> str:
         """The graph in Graphviz DOT format."""
 
+    def subgraph(self, begin: int, end: int) -> tuple[Poa, list[int]]:
+        """
+        Extract the sub-graph over parent node ids ``begin..=end``.
+
+        Returns the sub-graph as a new :class:`Poa` plus a list mapping each
+        sub-graph node index to its parent node id. Node selection walks
+        backwards from ``end`` (ancestors plus aligned siblings, id ``>= begin``),
+        so a full-span window does not necessarily keep every node on a
+        branching graph.
+        """
+
     def num_nodes(self) -> int: ...
     def num_edges(self) -> int: ...
     def num_sequences(self) -> int: ...

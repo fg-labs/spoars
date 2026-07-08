@@ -90,3 +90,54 @@ def test_min_coverage_consensus() -> None:
 def test_version_is_exposed() -> None:
     assert isinstance(spoars.__version__, str)
     assert spoars.__version__
+
+
+def test_subgraph_full_span_of_a_linear_graph_keeps_every_node() -> None:
+    # Identical sequences collapse onto a single unbranched path (no aligned-node
+    # siblings), so the last node's ancestors are every node in the graph and a
+    # full-span window is a faithful copy.
+    g = spoars.poa(["ACGTACGT", "ACGTACGT", "ACGTACGT"])
+    n = g.num_nodes()
+    sub, mapping = g.subgraph(0, n - 1)
+    assert sub.num_nodes() == n
+    assert len(mapping) == n
+    assert mapping == list(range(n))  # ascending parent ids for a full span
+    # Sub-Poa is usable for inspection (GFA export of a window).
+    assert sub.gfa().startswith("H\t")
+
+
+def test_subgraph_narrow_window_is_a_subset() -> None:
+    # `subgraph` walks backward (ancestors) from `end`, so with a branching graph the
+    # sub-graph is a subset even at a full-id window; narrow it further here to also
+    # exercise the `begin` lower bound.
+    g = spoars.poa(["ACGTACGT", "ACGAACGT", "ACGTAAGT"])
+    n = g.num_nodes()
+    sub, mapping = g.subgraph(n // 2, n - 1)
+    assert sub.num_nodes() < n
+    assert len(mapping) == sub.num_nodes()
+    assert all(n // 2 <= parent <= n - 1 for parent in mapping)
+
+
+def test_subgraph_on_a_branching_graph_keeps_only_ancestors_of_end() -> None:
+    # A window spanning every node id still yields a sub-graph, not the whole graph,
+    # because `subgraph` only keeps ancestors of `end` (plus their aligned siblings)
+    # that fall within the id window -- nodes downstream of `end` are excluded even
+    # when their id is < end.
+    g = spoars.poa(["ACGTACGT", "ACGAACGT", "ACGTAAGT"])
+    n = g.num_nodes()
+    sub, mapping = g.subgraph(0, n - 1)
+    assert sub.num_nodes() < n
+    assert len(mapping) == sub.num_nodes()
+    assert all(0 <= parent <= n - 1 for parent in mapping)
+    assert mapping == sorted(mapping)  # ascending parent ids (arena iteration order)
+
+
+def test_subgraph_out_of_range_raises_value_error() -> None:
+    # An out-of-range node id must raise a catchable ValueError, not surface the
+    # underlying Rust panic as an (uncatchable) PanicException.
+    g = spoars.poa(["ACGT", "ACGT"])
+    n = g.num_nodes()
+    with pytest.raises(ValueError):
+        g.subgraph(0, n)  # end == num_nodes is out of range
+    with pytest.raises(ValueError):
+        g.subgraph(n, 0)  # begin out of range

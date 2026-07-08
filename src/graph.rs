@@ -327,6 +327,105 @@ impl Graph {
         columns
     }
 
+    /// Extract the node-induced sub-DAG spanning parent node ids `begin..=end`.
+    ///
+    /// Returns the subgraph and a `Vec` indexed by the subgraph's `NodeId.0`, giving the
+    /// corresponding `NodeId` in `self`. Mirrors `spoa::Graph::Subgraph` (`graph.cpp:574-628`),
+    /// which internally calls `ExtractSubgraph(nodes_[end], nodes_[begin])` (`graph.cpp:551-572`).
+    ///
+    /// Node selection walks **backwards** from `end` over in-edges and aligned nodes, keeping any
+    /// node whose id is `>= begin`. `num_codes` / `coder` / `decoder` are copied; in-edges are
+    /// rebuilt (with the original weights) and aligned-node groups re-linked among kept nodes only;
+    /// then the subgraph is topologically sorted. Per-sequence paths are **not** copied (spoa leaves
+    /// `sequences_` empty — its `TODO(rvaser)`), so every subgraph edge is labeled `0` and each
+    /// connected node reports `coverage() == 1`; this matches spoa exactly.
+    ///
+    /// # Panics
+    /// Panics if `end` is out of range: it indexes `self.nodes` (and the `is_in_subgraph`
+    /// mask). `begin` is never used to index — it only appears in a `>=` comparison — so a
+    /// `begin` past the end of the graph does not panic; it simply yields an empty (or
+    /// partial) subgraph.
+    pub fn subgraph(&self, begin: NodeId, end: NodeId) -> (Graph, Vec<NodeId>) {
+        // ExtractSubgraph: stack-DFS backwards from `end`, keeping nodes with id >= begin.
+        let mut is_in_subgraph = vec![false; self.nodes.len()];
+        let mut stack: Vec<NodeId> = vec![end];
+        while let Some(curr) = stack.pop() {
+            let idx = curr.0 as usize;
+            if !is_in_subgraph[idx] && curr.0 >= begin.0 {
+                for &edge_id in &self.nodes[idx].inedges {
+                    stack.push(self.edges[edge_id.0 as usize].tail);
+                }
+                for &aligned in &self.nodes[idx].aligned_nodes {
+                    stack.push(aligned);
+                }
+                is_in_subgraph[idx] = true;
+            }
+        }
+
+        let mut subgraph = Graph::new();
+        subgraph.num_codes = self.num_codes;
+        subgraph.coder = self.coder;
+        subgraph.decoder = self.decoder.clone();
+
+        // subgraph_to_graph is indexed by subgraph node id; graph_to_subgraph inverts it.
+        let mut subgraph_to_graph: Vec<NodeId> = Vec::new();
+        let mut graph_to_subgraph: Vec<Option<NodeId>> = vec![None; self.nodes.len()];
+
+        // Add nodes in parent id order (matches spoa's `for (const auto& it : nodes_)`).
+        for (parent_idx, node) in self.nodes.iter().enumerate() {
+            if !is_in_subgraph[parent_idx] {
+                continue;
+            }
+            let new_id = subgraph.add_node(node.code);
+            graph_to_subgraph[parent_idx] = Some(new_id);
+            subgraph_to_graph.push(NodeId(parent_idx as u32));
+        }
+
+        // Connect: in-edges (with original weight) + aligned groups among kept nodes only.
+        for (parent_idx, node) in self.nodes.iter().enumerate() {
+            let Some(jt) = graph_to_subgraph[parent_idx] else {
+                continue;
+            };
+            for &edge_id in &node.inedges {
+                let edge = &self.edges[edge_id.0 as usize];
+                if let Some(sub_tail) = graph_to_subgraph[edge.tail.0 as usize] {
+                    // label = subgraph.sequences.len() (== 0), matching spoa's AddEdge.
+                    let label = subgraph.sequences.len() as u32;
+                    subgraph.add_edge(sub_tail, jt, edge.weight, label);
+                }
+            }
+            for &aligned in &node.aligned_nodes {
+                if let Some(sub_aligned) = graph_to_subgraph[aligned.0 as usize] {
+                    subgraph.nodes[jt.0 as usize]
+                        .aligned_nodes
+                        .push(sub_aligned);
+                }
+            }
+        }
+
+        subgraph.topological_sort();
+        (subgraph, subgraph_to_graph)
+    }
+
+    /// Rewrite an alignment computed against a subgraph back into this graph's node-id space.
+    /// Maps only the node-id element (`.0`) of each `(node_id, seq_pos)` pair, via
+    /// `subgraph_to_graph`; gap entries (`node_id == -1`) pass through unchanged. Mirrors
+    /// `spoa::Graph::UpdateAlignment` (`graph.cpp:630-638`).
+    ///
+    /// # Panics
+    /// Panics if a non-gap node id is out of range for `subgraph_to_graph`.
+    pub fn update_alignment(
+        &self,
+        subgraph_to_graph: &[NodeId],
+        alignment: &mut crate::align::Alignment,
+    ) {
+        for entry in alignment.iter_mut() {
+            if entry.0 != -1 {
+                entry.0 = subgraph_to_graph[entry.0 as usize].0 as i32;
+            }
+        }
+    }
+
     /// Appends a new node with the given code and returns its id.
     ///
     /// Mirrors `spoa::Graph::AddNode` (`graph.cpp:76-79`): the new node's id is simply the
@@ -1110,6 +1209,8 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::align::AlignmentEngine;
+    use proptest::prelude::*;
 
     #[test]
     fn add_node_assigns_sequential_ids() {
@@ -1690,5 +1791,108 @@ mod tests {
             g.is_topologically_sorted(),
             "rank_to_node must be a valid topological order"
         );
+    }
+
+    /// A tiny hand-built graph: linear A->C->G->T (node ids 0..=3), no aligned peers.
+    /// Extracting the window [1, 2] keeps nodes with id in {1, 2} reachable walking
+    /// backwards from node `end`=2: node 2 (G -> keep), its in-edge tail node 1, its
+    /// aligned peers (none). Node 1's in-edge tail is node 0 (id 0 < begin=1 -> dropped).
+    fn linear_graph_acgt() -> Graph {
+        let mut g = Graph::new();
+        let mut engine = crate::align::sisd::SisdEngine::new(
+            crate::align::AlignmentType::Global,
+            crate::align::Scoring::spoa_default(),
+        );
+        let seq = b"ACGT";
+        let (aln, _s) = engine.align(seq, &g);
+        g.add_alignment_weight(&aln, seq, 1).unwrap();
+        g
+    }
+
+    #[test]
+    fn subgraph_keeps_only_nodes_in_id_window_and_remaps() {
+        let g = linear_graph_acgt();
+        // Window [1, 2]: keep parent nodes 1 (C) and 2 (G).
+        let (sub, sub_to_graph) = g.subgraph(NodeId(1), NodeId(2));
+        assert_eq!(sub.num_nodes(), 2);
+        // Map is indexed by subgraph node id; parent ids appear in ascending order
+        // because Subgraph builds nodes by iterating the parent arena in id order.
+        assert_eq!(sub_to_graph, vec![NodeId(1), NodeId(2)]);
+        // Codes carried over: parent node 1 is 'C', node 2 is 'G'.
+        assert_eq!(sub.decode(sub.node(NodeId(0)).code), Some(b'C'));
+        assert_eq!(sub.decode(sub.node(NodeId(1)).code), Some(b'G'));
+        // One internal edge (C->G); the edge into node 1 from node 0 is dropped
+        // (node 0 is outside the window).
+        assert_eq!(sub.num_edges(), 1);
+        assert_eq!(sub.edge(EdgeId(0)).tail, NodeId(0));
+        assert_eq!(sub.edge(EdgeId(0)).head, NodeId(1));
+        // Faithful quirk: subgraph edges are labeled 0 (sequences not copied).
+        assert_eq!(sub.edge(EdgeId(0)).labels, vec![0]);
+        // num_codes / coder / decoder copied verbatim.
+        assert_eq!(sub.num_codes(), g.num_codes());
+        // Sequences are NOT copied.
+        assert_eq!(sub.sequence_starts().len(), 0);
+        // Topologically sorted.
+        assert!(sub.is_topologically_sorted());
+    }
+
+    #[test]
+    fn update_alignment_remaps_node_ids_and_passes_gaps() {
+        let g = linear_graph_acgt();
+        // Pretend a subgraph->graph map where subgraph ids 0,1 map to parent ids 2,3.
+        let map = vec![NodeId(2), NodeId(3)];
+        // Alignment pairs: (subgraph_node_id, seq_pos); -1 is a gap.
+        let mut aln: crate::align::Alignment = vec![(-1, 0), (0, 1), (1, 2)];
+        g.update_alignment(&map, &mut aln);
+        assert_eq!(aln, vec![(-1, 0), (2, 1), (3, 2)]);
+    }
+
+    proptest! {
+        /// Over random windows on a random small family: every kept subgraph node maps to a
+        /// parent id `>= begin`, and every subgraph edge connects two kept nodes.
+        ///
+        /// Note there is no corresponding `<= end` upper bound to assert: `ExtractSubgraph`
+        /// (`graph.cpp:551-572`) walks backwards from `end` over both in-edges *and* aligned-node
+        /// cross-links, and aligned peers are not id-ordered (a mismatch column links a low-id
+        /// node to the higher-id node created for the divergent base — see
+        /// `topological_sort_ranks_every_node_including_aligned_groups` above for exactly this
+        /// shape). So a low-id `end` can pull in a higher-id aligned peer, whose own in-edges are
+        /// then walked too; the C++ oracle has no upper-bound check (only `curr->id >= end->id`,
+        /// the window's *lower* bound, gates inclusion), and this port is faithful to that.
+        #[test]
+        fn subgraph_kept_ids_in_window_and_edges_internal(
+            seqs in proptest::collection::vec("[ACGT]{1,12}", 2..6),
+            a in 0u32..40,
+            b in 0u32..40,
+        ) {
+            let mut g = Graph::new();
+            let mut engine = crate::align::sisd::SisdEngine::new(
+                crate::align::AlignmentType::Global,
+                crate::align::Scoring::spoa_default(),
+            );
+            for s in &seqs {
+                let bytes = s.as_bytes();
+                let (aln, _) = engine.align(bytes, &g);
+                g.add_alignment_weight(&aln, bytes, 1).unwrap();
+            }
+            prop_assume!(g.num_nodes() > 0);
+            let n = g.num_nodes() as u32;
+            let begin = NodeId(a % n);
+            let end = NodeId(b % n);
+
+            let (sub, map) = g.subgraph(begin, end);
+            // Map length equals subgraph node count.
+            prop_assert_eq!(map.len(), sub.num_nodes());
+            // Every kept parent id respects the window's lower bound.
+            for &parent_id in &map {
+                prop_assert!(parent_id.0 >= begin.0);
+            }
+            // Every subgraph edge connects two kept nodes (ids < subgraph node count).
+            for e in sub.edges() {
+                prop_assert!((e.tail.0 as usize) < sub.num_nodes());
+                prop_assert!((e.head.0 as usize) < sub.num_nodes());
+            }
+            prop_assert!(sub.is_topologically_sorted());
+        }
     }
 }
