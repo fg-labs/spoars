@@ -355,6 +355,16 @@ impl SimdEngine {
         engine
     }
 
+    /// The alignment type this engine was built with.
+    pub fn alignment_type(&self) -> AlignmentType {
+        self.alignment_type
+    }
+
+    /// The scoring this engine was built with.
+    pub fn scoring(&self) -> Scoring {
+        self.scoring
+    }
+
     /// Returns disjoint `&mut` handles to the row-major scratch and the SSE4.1 striped buffers
     /// (`Vec<__m128i>`, shared by the int16 and int32 SSE4.1 kernels), lazily switching
     /// [`SimdEngine::striped`] to the [`StripedScratch::Sse41`] variant on first use. Splitting the
@@ -1621,5 +1631,16 @@ mod tests {
                 "query index {query_idx} out of range"
             );
         }
+    }
+
+    /// A freshly-built [`SimdEngine`] exposes the exact `alignment_type`/`scoring` it was
+    /// constructed with, so callers (e.g. `spoars-py`'s `Poa.subgraph`) can build a fresh engine
+    /// with matching parameters without threading them through separately.
+    #[test]
+    fn simd_engine_exposes_its_alignment_type_and_scoring() {
+        let s = Scoring::spoa_default();
+        let e = SimdEngine::new(AlignmentType::Overlap, s);
+        assert_eq!(e.alignment_type(), AlignmentType::Overlap);
+        assert_eq!(e.scoring(), s);
     }
 }
