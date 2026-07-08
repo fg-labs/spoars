@@ -36,10 +36,16 @@ required-features = ["cli"]
 # library-only consumer can opt out with `default-features = false`.
 default = ["cli"]
 cli = ["dep:needletail"]
+# Opt-in structural (de)serialization of a built `Graph` (and its Node/Edge/id
+# types). Off by default; the wire format is native-Rust, not spoa's Cereal.
+serde = ["dep:serde"]
 
 [dependencies]
 # Optional: only pulled in by the `cli` feature (used solely by src/bin/spoars.rs).
 needletail = { version = "0.7", optional = true }
+# Optional: enables `serde::{Serialize, Deserialize}` on the graph types (the
+# `serde` feature). Not built unless a consumer opts in.
+serde = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
 # Always available to tests (tests/support/generators.rs reads FASTA/FASTQ),

@@ -47,6 +47,8 @@ jobs:
           tool: nextest
       - name: Unit and integration tests
         run: cargo ci-test
+      - name: Serde feature round-trip tests
+        run: cargo test --locked --features serde --test serde_roundtrip
       - name: Doctests
         run: cargo test --doc
 
@@ -69,6 +71,8 @@ jobs:
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Clippy check
         run: cargo ci-lint
+      - name: Clippy (serde feature)
+        run: cargo clippy --all-targets --features serde -- -D warnings
 
   format:
     runs-on: ubuntu-latest
@@ -160,3 +164,4 @@ jobs:
         run: |
           cargo check --locked
           cargo check --locked --no-default-features
+          cargo check --locked --features serde
