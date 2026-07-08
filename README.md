@@ -75,6 +75,13 @@ g.gfa()         # GFA v1
 import pickle
 restored = pickle.loads(pickle.dumps(g))
 restored = spoars.Poa.from_json(g.to_json())
+
+# Inspect the graph directly (node ids are plain ints):
+g.rank_order()          # node ids in topological order
+g.node_coverage(3)      # how many sequences pass through node 3
+g.node_base(3)          # 'T' (or None)
+g.sequence_path(0)      # node ids sequence 0 traverses
+g.edges()               # [(tail, head, weight), ...]
 ```
 
 See [`spoars-py/README.md`](spoars-py/README.md) for the full Python API.

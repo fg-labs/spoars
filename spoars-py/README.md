@@ -36,6 +36,17 @@ import pickle
 
 restored = pickle.loads(pickle.dumps(g))
 restored = spoars.Poa.from_json(g.to_json())
+
+# Inspect the graph directly — node ids are plain ints:
+g.num_codes()  # size of the code alphabet
+g.rank_order()  # node ids in topological order
+g.node_code(3), g.node_base(3), g.node_coverage(3)
+g.node_successor(3, 0)  # next node id sequence 0 visits after node 3 (or None)
+g.sequence_path(0)  # node ids sequence 0 traverses
+g.consensus_nodes()  # node ids on the consensus path
+g.edges()  # [(tail, head, weight), ...]
+g.msa_columns()  # (column-of-each-node, num_columns)
+g.column_members()  # per column: [(sequence_index, node_id), ...]
 ```
 
 `alignment_type` is one of `"global"`, `"local"`, or `"overlap"`. `Scoring` takes

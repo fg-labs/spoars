@@ -357,7 +357,9 @@ impl Poa {
     fn encode(&self, base: &str) -> PyResult<Option<u32>> {
         let bytes = base.as_bytes();
         if bytes.len() != 1 {
-            return Err(PyValueError::new_err("base must be a single character"));
+            return Err(PyValueError::new_err(
+                "base must be a single ASCII character",
+            ));
         }
         Ok(self.graph.encode(bytes[0]))
     }
