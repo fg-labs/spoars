@@ -16,7 +16,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use spoars::align::{AlignmentEngine, AlignmentType, GapMode, Scoring as RsScoring, SimdEngine};
-use spoars::graph::Graph;
+use spoars::graph::{Graph, NodeId};
 
 /// Maps an alignment-type name (case-insensitive `"global"`/`"local"`/`"overlap"`,
 /// or the spoa aliases `"nw"`/`"sw"`/`"ov"`) to the Rust enum.
@@ -182,6 +182,37 @@ impl Poa {
     /// The graph in Graphviz DOT format.
     fn dot(&self) -> String {
         self.graph.to_dot()
+    }
+
+    /// Extract the node-induced sub-graph spanning parent node ids ``begin..=end``.
+    ///
+    /// Returns ``(sub_poa, subgraph_to_graph)`` where ``sub_poa`` is a new :class:`Poa`
+    /// wrapping the sub-graph (carrying this graph's alignment type and scoring) and
+    /// ``subgraph_to_graph[i]`` is the parent node id of sub-graph node ``i``. Mirrors
+    /// ``spoa::Graph::Subgraph``: node selection walks *backwards* from ``end`` over
+    /// in-edges and aligned nodes, keeping any visited node whose id is ``>= begin`` — so
+    /// a full-span window (``0, num_nodes() - 1``) does not necessarily keep every node
+    /// on a branching graph. Note: per-sequence paths are not carried into the sub-graph.
+    ///
+    /// Raises :class:`ValueError` if ``begin`` or ``end`` is ``>= num_nodes()``.
+    #[pyo3(signature = (begin, end))]
+    fn subgraph(&self, begin: u32, end: u32) -> PyResult<(Poa, Vec<u32>)> {
+        let n = self.graph.num_nodes() as u32;
+        if begin >= n || end >= n {
+            return Err(PyValueError::new_err(format!(
+                "begin ({begin}) and end ({end}) must be < num_nodes ({n})"
+            )));
+        }
+        let (sub_graph, map) = self.graph.subgraph(NodeId(begin), NodeId(end));
+        let engine = SimdEngine::new(self.engine.alignment_type(), self.engine.scoring());
+        let map: Vec<u32> = map.into_iter().map(|n| n.0).collect();
+        Ok((
+            Poa {
+                graph: sub_graph,
+                engine,
+            },
+            map,
+        ))
     }
 
     /// Number of nodes in the graph.
