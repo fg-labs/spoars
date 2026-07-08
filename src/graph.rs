@@ -796,6 +796,31 @@ impl Graph {
         dst
     }
 
+    /// The consensus (as [`Graph::generate_consensus_min_coverage`]) plus, for each emitted base,
+    /// the total coverage of that consensus column: the consensus node's own [`Node::coverage`]
+    /// summed with each of its aligned peers'. One entry per emitted base, so the returned `Vec`'s
+    /// length equals the consensus string's length.
+    ///
+    /// Mirrors `spoa::Graph::GenerateConsensus(min_coverage, summary*)` (`graph.cpp:388-408`): the
+    /// per-node *filter* uses the consensus node's own coverage (`>= min_coverage`, matching the
+    /// consensus string), while the emitted *value* is that node's coverage plus its aligned peers'.
+    pub fn generate_consensus_with_coverage(&mut self, min_coverage: i32) -> (String, Vec<u32>) {
+        let dst = self.generate_consensus_min_coverage(min_coverage);
+        let mut summary: Vec<u32> = Vec::new();
+        for i in 0..self.consensus.len() {
+            let node_id = self.consensus[i];
+            let node = &self.nodes[node_id.0 as usize];
+            if node.coverage(self) as i32 >= min_coverage {
+                let mut total = node.coverage(self);
+                for &aligned in &node.aligned_nodes {
+                    total += self.nodes[aligned.0 as usize].coverage(self);
+                }
+                summary.push(total);
+            }
+        }
+        (dst, summary)
+    }
+
     /// Maps every node id to its multiple-sequence-alignment column, folding each node's
     /// `aligned_nodes` peers into the same column as their representative. Returns
     /// `(node_id_to_column, row_size)`, where `row_size` is the total number of distinct MSA
@@ -1809,6 +1834,20 @@ mod tests {
         g
     }
 
+    /// Build a small graph from `seqs` with global spoa-default alignment.
+    fn global_graph(seqs: &[&str]) -> Graph {
+        use crate::align::{AlignmentType, Scoring};
+        let mut g = Graph::new();
+        let mut engine =
+            crate::align::sisd::SisdEngine::new(AlignmentType::Global, Scoring::spoa_default());
+        for s in seqs {
+            let bytes = s.as_bytes();
+            let (aln, _) = engine.align(bytes, &g);
+            g.add_alignment_weight(&aln, bytes, 1).unwrap();
+        }
+        g
+    }
+
     #[test]
     fn subgraph_keeps_only_nodes_in_id_window_and_remaps() {
         let g = linear_graph_acgt();
@@ -1894,5 +1933,30 @@ mod tests {
             }
             prop_assert!(sub.is_topologically_sorted());
         }
+    }
+
+    #[test]
+    fn consensus_with_coverage_matches_consensus_len_and_sums_aligned_peers() {
+        let mut g = global_graph(&["ACGT", "ACGT", "AGGT"]);
+        let (cons, cov) = g.generate_consensus_with_coverage(-1);
+        // Summary has exactly one entry per emitted consensus base.
+        assert_eq!(cov.len(), cons.len());
+        // The unfiltered consensus equals generate_consensus().
+        assert_eq!(cons, g.generate_consensus());
+        // Every coverage entry is >= 1 (each consensus node is on >=1 sequence).
+        assert!(cov.iter().all(|&c| c >= 1));
+        // Coverage-summary length equals the filtered consensus length for any min_coverage.
+        let (cons2, cov2) = g.generate_consensus_with_coverage(2);
+        assert_eq!(cov2.len(), cons2.len());
+        assert_eq!(cons2, g.generate_consensus_min_coverage(2));
+        // min_coverage = 3 discriminates the own-vs-total filter: the divergent column's
+        // consensus node has own coverage 2 (< 3, so excluded) but total 3 (own + aligned peer).
+        // A summary that (wrongly) filtered on the total would keep an extra entry, breaking the
+        // length invariant below.
+        let (cons3, cov3) = g.generate_consensus_with_coverage(3);
+        assert_eq!(cov3.len(), cons3.len());
+        assert_eq!(cons3, g.generate_consensus_min_coverage(3));
+        // The divergent node really is excluded at min_coverage = 3 (so this case is non-trivial).
+        assert!(cons3.len() < cons.len());
     }
 }
