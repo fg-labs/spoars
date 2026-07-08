@@ -404,6 +404,25 @@ impl Graph {
         (subgraph, subgraph_to_graph)
     }
 
+    /// Rewrite an alignment computed against a subgraph back into this graph's node-id space.
+    /// Maps only the node-id element (`.0`) of each `(node_id, seq_pos)` pair, via
+    /// `subgraph_to_graph`; gap entries (`node_id == -1`) pass through unchanged. Mirrors
+    /// `spoa::Graph::UpdateAlignment` (`graph.cpp:630-638`).
+    ///
+    /// # Panics
+    /// Panics if a non-gap node id is out of range for `subgraph_to_graph`.
+    pub fn update_alignment(
+        &self,
+        subgraph_to_graph: &[NodeId],
+        alignment: &mut crate::align::Alignment,
+    ) {
+        for entry in alignment.iter_mut() {
+            if entry.0 != -1 {
+                entry.0 = subgraph_to_graph[entry.0 as usize].0 as i32;
+            }
+        }
+    }
+
     /// Appends a new node with the given code and returns its id.
     ///
     /// Mirrors `spoa::Graph::AddNode` (`graph.cpp:76-79`): the new node's id is simply the
@@ -1812,6 +1831,17 @@ mod tests {
         assert_eq!(sub.sequence_starts().len(), 0);
         // Topologically sorted.
         assert!(sub.is_topologically_sorted());
+    }
+
+    #[test]
+    fn update_alignment_remaps_node_ids_and_passes_gaps() {
+        let g = linear_graph_acgt();
+        // Pretend a subgraph->graph map where subgraph ids 0,1 map to parent ids 2,3.
+        let map = vec![NodeId(2), NodeId(3)];
+        // Alignment pairs: (subgraph_node_id, seq_pos); -1 is a gap.
+        let mut aln: crate::align::Alignment = vec![(-1, 0), (0, 1), (1, 2)];
+        g.update_alignment(&map, &mut aln);
+        assert_eq!(aln, vec![(-1, 0), (2, 1), (3, 2)]);
     }
 
     proptest! {
