@@ -254,3 +254,61 @@ def test_round_trip_preserves_non_default_engine_for_further_alignments() -> Non
     assert (
         default_engine.consensus() != original.consensus() or default_engine.msa() != original.msa()
     )
+
+
+def test_node_and_scalar_accessors_are_consistent() -> None:
+    reads = ["ACGTACGT", "ACGAACGT", "ACGTAAGT"]
+    g = spoars.poa(reads)
+    n = g.num_nodes()
+    # rank_order is a permutation of all node ids.
+    assert sorted(g.rank_order()) == list(range(n))
+    # encode/decode round-trip for every seen base.
+    for base in "ACGT":
+        code = g.encode(base)
+        assert code is not None
+        assert g.decode(code) == base
+    assert g.encode("Z") is None  # unseen base
+    assert g.num_codes() == 4
+    # sequence_path reconstructs each read's bases in order.
+    for i, read in enumerate(reads):
+        path = g.sequence_path(i)
+        assert "".join(g.node_base(node) or "" for node in path) == read
+    # sequence_starts[i] is the first node of sequence_path(i).
+    starts = g.sequence_starts()
+    assert [g.sequence_path(i)[0] for i in range(len(reads))] == starts
+    # node_coverage is >= 1 for every node; node_labels length == coverage.
+    for node in range(n):
+        cov = g.node_coverage(node)
+        assert cov >= 1
+        assert len(g.node_labels(node)) == cov
+    # consensus_nodes decode to the consensus string.
+    g.consensus()  # populate the consensus path
+    assert "".join(g.node_base(x) or "" for x in g.consensus_nodes()) == g.consensus()
+
+
+def test_node_successor_walks_a_sequence() -> None:
+    g = spoars.poa(["ACGT", "ACGT"])
+    # Walking node_successor from the sequence start reproduces sequence_path(0).
+    walked: list[int] = []
+    node: int | None = g.sequence_starts()[0]
+    while node is not None:
+        walked.append(node)
+        node = g.node_successor(node, 0)
+    assert walked == g.sequence_path(0)
+
+
+def test_inspection_accessors_reject_out_of_range() -> None:
+    g = spoars.poa(["ACGT", "ACGT"])
+    n = g.num_nodes()
+    for call in (
+        lambda: g.node_code(n),
+        lambda: g.node_coverage(n),
+        lambda: g.node_base(n),
+        lambda: g.node_successor(n, 0),
+        lambda: g.node_labels(n),
+        lambda: g.sequence_path(g.num_sequences()),
+    ):
+        with pytest.raises(ValueError):
+            call()
+    with pytest.raises(ValueError):
+        g.encode("AC")  # not a single character
