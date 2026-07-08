@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Literal
+from typing import overload
+
 __version__: str
 
 class Scoring:
@@ -40,8 +43,22 @@ class Poa:
     def add(self, sequence: str, weight: int = 1) -> int:
         """Align and merge ``sequence``; return its 0-based sequence index."""
 
-    def consensus(self, min_coverage: int | None = None) -> str:
-        """The consensus sequence (optionally pruning low-coverage nodes)."""
+    # The consensus sequence (optionally pruning low-coverage nodes); with
+    # `with_coverage=True`, returns `(consensus, per_base_coverage)` instead.
+    @overload
+    def consensus(
+        self, min_coverage: int | None = None, with_coverage: Literal[False] = False
+    ) -> str: ...
+    @overload
+    def consensus(
+        self, min_coverage: int | None = None, with_coverage: Literal[True] = ...
+    ) -> tuple[str, list[int]]: ...
+    @overload
+    def consensus(
+        self, min_coverage: int | None = None, with_coverage: bool = False
+    ) -> str | tuple[str, list[int]]: ...
+    def consensus_composition(self) -> tuple[str, list[list[int]]]:
+        """The consensus plus a per-column base-composition matrix (rows = codes + a gap row)."""
 
     def msa(self, include_consensus: bool = False) -> list[str]:
         """The multiple sequence alignment, one row per added sequence."""

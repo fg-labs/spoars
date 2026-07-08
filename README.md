@@ -66,6 +66,8 @@ g = spoars.Poa(alignment_type="global", scoring=spoars.Scoring.default())
 for read in ["ACGTACGT", "ACGTTCGT", "ACGTACGT"]:
     g.add(read)
 g.consensus(min_coverage=2)
+consensus, coverage = g.consensus(with_coverage=True)  # (str, list[int])
+consensus, matrix = g.consensus_composition()  # (str, list[list[int]])
 g.gfa()         # GFA v1
 ```
 

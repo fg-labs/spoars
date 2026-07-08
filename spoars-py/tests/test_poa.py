@@ -141,3 +141,33 @@ def test_subgraph_out_of_range_raises_value_error() -> None:
         g.subgraph(0, n)  # end == num_nodes is out of range
     with pytest.raises(ValueError):
         g.subgraph(n, 0)  # begin out of range
+
+
+def test_consensus_with_coverage_returns_per_base_totals() -> None:
+    g = spoars.poa(["ACGT", "ACGT", "AGGT"])
+    plain = g.consensus()
+    cons, cov = g.consensus(with_coverage=True)
+    assert cons == plain
+    assert len(cov) == len(cons)
+    assert all(c >= 1 for c in cov)
+
+
+def test_consensus_composition_matrix_shape_and_column_sums() -> None:
+    seqs = ["ACGT", "ACGT", "AGGT"]
+    g = spoars.poa(seqs)
+    cons, matrix = g.consensus_composition()
+    assert len(matrix) >= 1
+    stride = len(cons)
+    assert all(len(row) == stride for row in matrix)
+    # Each column sums to at most the number of sequences.
+    for col in range(stride):
+        assert sum(row[col] for row in matrix) <= len(seqs)
+
+
+def test_consensus_composition_on_empty_poa_is_empty() -> None:
+    # An empty graph has a zero-length consensus (stride == 0); the reshape must not
+    # panic and must return an empty consensus with an empty matrix.
+    g = spoars.Poa()
+    cons, matrix = g.consensus_composition()
+    assert cons == ""
+    assert matrix == []
