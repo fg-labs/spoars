@@ -88,6 +88,13 @@ struct JsonValue {
     }
     return str;
   }
+
+  bool AsBool() const {
+    if (type != Type::kBool) {
+      throw std::runtime_error("[spoa_oracle] expected a JSON bool");
+    }
+    return boolean;
+  }
 };
 
 class JsonParser {
@@ -497,6 +504,7 @@ struct OracleCase {
   bool has_subgraph = false;
   std::uint32_t subgraph_begin = 0;
   std::uint32_t subgraph_end = 0;
+  bool summarize_consensus = false;
 };
 
 OracleCase ParseCase(const JsonValue& v) {
@@ -549,6 +557,10 @@ OracleCase ParseCase(const JsonValue& v) {
     result.has_subgraph = true;
     result.subgraph_begin = static_cast<std::uint32_t>(sg.array[0].AsInt());
     result.subgraph_end = static_cast<std::uint32_t>(sg.array[1].AsInt());
+  }
+
+  if (v.Has("summarize_consensus") && !v.At("summarize_consensus").IsNull()) {
+    result.summarize_consensus = v.At("summarize_consensus").AsBool();
   }
 
   return result;
@@ -633,6 +645,29 @@ void RunCase(const OracleCase& oc, std::ostream& out) {
     subgraph_json = sg.str();
   }
 
+  std::string summary_json;
+  if (oc.summarize_consensus) {
+    std::vector<std::uint32_t> cov;
+    graph.GenerateConsensus(oc.min_coverage, &cov);
+    std::vector<std::uint32_t> comp;
+    std::string comp_consensus = graph.GenerateConsensus(&comp, true);
+    std::size_t stride = comp_consensus.size();
+
+    std::ostringstream ss;
+    ss << ",\"consensus_coverage\":[";
+    for (std::size_t i = 0; i < cov.size(); ++i) {
+      if (i != 0) ss << ",";
+      ss << cov[i];
+    }
+    ss << "],\"consensus_composition\":{\"stride\":" << stride << ",\"matrix\":[";
+    for (std::size_t i = 0; i < comp.size(); ++i) {
+      if (i != 0) ss << ",";
+      ss << comp[i];
+    }
+    ss << "]}";
+    summary_json = ss.str();
+  }
+
   out << "{\"id\":" << oc.id << ",\"alignments\":[";
   for (std::size_t i = 0; i < alignments.size(); ++i) {
     if (i != 0) {
@@ -656,7 +691,7 @@ void RunCase(const OracleCase& oc, std::ostream& out) {
     out << "\"" << JsonEscape(msa[i]) << "\"";
   }
   out << "],\"gfa\":\"" << JsonEscape(gfa) << "\",\"dot\":\""
-      << JsonEscape(dot) << "\"" << subgraph_json << "}\n";
+      << JsonEscape(dot) << "\"" << subgraph_json << summary_json << "}\n";
   out.flush();
 }
 
