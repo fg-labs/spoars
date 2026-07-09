@@ -22,6 +22,7 @@ Partial order alignment builds a directed acyclic graph from a set of related se
 - **`#![deny(unsafe_code)]`** everywhere except the isolated SIMD kernels module.
 - Consensus generation (with a minimum-coverage variant), MSA, and GFA/DOT export.
 - Read-only accessors for inspecting the built graph, and an `AlignmentEngine` trait you can implement yourself.
+- Optional `serde` feature (off by default) for structural (de)serialization of a built `Graph`.
 
 ## Quick start
 
@@ -69,6 +70,11 @@ g.consensus(min_coverage=2)
 consensus, coverage = g.consensus(with_coverage=True)  # (str, list[int])
 consensus, matrix = g.consensus_composition()  # (str, list[list[int]])
 g.gfa()         # GFA v1
+
+# Cache or transmit a graph: pickle, or JSON via to_json / from_json.
+import pickle
+restored = pickle.loads(pickle.dumps(g))
+restored = spoars.Poa.from_json(g.to_json())
 ```
 
 See [`spoars-py/README.md`](spoars-py/README.md) for the full Python API.

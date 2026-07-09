@@ -1,3 +1,5 @@
+import pickle
+
 import pytest
 import spoars
 
@@ -171,3 +173,84 @@ def test_consensus_composition_on_empty_poa_is_empty() -> None:
     cons, matrix = g.consensus_composition()
     assert cons == ""
     assert matrix == []
+
+
+def test_json_round_trip_preserves_consensus_msa_gfa() -> None:
+    g = spoars.poa(["ACGTACGT", "ACGAACGT", "ACGTAAGT"])
+    restored = spoars.Poa.from_json(g.to_json())
+    assert restored.consensus() == g.consensus()
+    assert restored.msa() == g.msa()
+    assert restored.gfa() == g.gfa()
+    assert restored.num_nodes() == g.num_nodes()
+
+
+def test_pickle_round_trip_preserves_graph_and_stays_functional() -> None:
+    g = spoars.Poa(alignment_type="global", scoring=spoars.Scoring.default())
+    for read in ["ACGTACGT", "ACGAACGT", "ACGTAAGT"]:
+        g.add(read)
+    restored = pickle.loads(pickle.dumps(g))
+    assert restored.consensus() == g.consensus()
+    assert restored.msa() == g.msa()
+    assert restored.gfa() == g.gfa()
+    # A restored Poa is fully functional: its engine (alignment type + scoring) survived,
+    # so further reads align the same way.
+    restored.add("ACGTACGT")
+    g.add("ACGTACGT")
+    assert restored.consensus() == g.consensus()
+
+
+def test_from_json_rejects_malformed_input() -> None:
+    # Malformed JSON surfaces as a catchable ValueError, not a panic.
+    with pytest.raises(ValueError):
+        spoars.Poa.from_json("not json at all")
+
+
+def test_round_trip_preserves_non_default_engine_for_further_alignments() -> None:
+    """
+    Round-tripping must carry over the non-default alignment type and scoring.
+
+    The reads below have divergent flanks around a shared core, and `new_read` (added
+    *after* restoring) has its own pair of flanks that don't match the core's flanks in
+    any of the three reads. Under local alignment those flanks are free overhangs
+    (soft-clipped: they add disconnected nodes to the graph but don't force new aligned
+    columns), while under the default global alignment every base -- including the
+    flanks -- must be aligned end-to-end (forced into the existing columns as
+    mismatches). A flank-free `new_read` would align identically under both engines
+    (nothing to clip), exercising only the scoring difference; giving it non-matching
+    flanks makes the alignment-type dimension load-bearing too. That difference is only
+    visible once we align a *further* read after restoring, so a restored engine that
+    quietly reconstructed with default parameters would still reproduce the pre-restore
+    consensus/MSA but diverge here.
+    """
+    reads = ["TTTTACGTACGTACGTGGGG", "CCCCACGTACGTACGTAAAA", "GGGGACGTACGTACGTCCCC"]
+    new_read = "AAAAACGTACGTACGTTTTT"
+    scoring = spoars.Scoring(3, -2, -5, -3, -8, -2)
+
+    original = spoars.Poa(alignment_type="local", scoring=scoring)
+    for read in reads:
+        original.add(read)
+
+    restored_via_pickle = pickle.loads(pickle.dumps(original))
+    restored_via_json = spoars.Poa.from_json(original.to_json())
+
+    for restored in (restored_via_pickle, restored_via_json):
+        restored.add(new_read)
+    original.add(new_read)
+
+    assert restored_via_pickle.consensus() == original.consensus()
+    assert restored_via_pickle.msa() == original.msa()
+    assert restored_via_json.consensus() == original.consensus()
+    assert restored_via_json.msa() == original.msa()
+
+    # Discrimination check: a default-engine Poa (global alignment, default scoring)
+    # given the identical reads must diverge from the non-default result above --
+    # otherwise this test wouldn't actually distinguish a correct restore from a
+    # buggy one that ignores the round-tripped alignment type + scoring.
+    default_engine = spoars.Poa()
+    for read in reads:
+        default_engine.add(read)
+    default_engine.add(new_read)
+
+    assert (
+        default_engine.consensus() != original.consensus() or default_engine.msa() != original.msa()
+    )

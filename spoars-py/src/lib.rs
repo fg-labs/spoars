@@ -31,6 +31,15 @@ fn parse_alignment_type(name: &str) -> PyResult<AlignmentType> {
     }
 }
 
+/// Maps an [`AlignmentType`] to its canonical name, the inverse of [`parse_alignment_type`].
+fn alignment_type_name(t: AlignmentType) -> &'static str {
+    match t {
+        AlignmentType::Global => "global",
+        AlignmentType::Local => "local",
+        AlignmentType::Overlap => "overlap",
+    }
+}
+
 /// Validated match/mismatch/gap scoring, mirroring `spoars::align::Scoring`.
 ///
 /// Positive gap penalties are rejected (spoa's sign convention). The gap model
@@ -107,6 +116,8 @@ impl Scoring {
 struct Poa {
     graph: Graph,
     engine: SimdEngine,
+    alignment_type: AlignmentType,
+    scoring: Scoring,
 }
 
 #[pymethods]
@@ -123,6 +134,8 @@ impl Poa {
         Ok(Self {
             graph: Graph::new(),
             engine: SimdEngine::new(alignment_type, scoring.inner),
+            alignment_type,
+            scoring,
         })
     }
 
@@ -237,6 +250,8 @@ impl Poa {
             Poa {
                 graph: sub_graph,
                 engine,
+                alignment_type: self.alignment_type,
+                scoring: self.scoring,
             },
             map,
         ))
@@ -267,6 +282,68 @@ impl Poa {
             self.graph.sequence_starts().len(),
             self.graph.num_nodes()
         )
+    }
+
+    /// Serialize the full builder state (graph + alignment type + scoring) to a JSON string.
+    fn to_json(&self) -> PyResult<String> {
+        let s = self.scoring.inner;
+        let value = serde_json::json!({
+            "graph": &self.graph,
+            "alignment_type": alignment_type_name(self.alignment_type),
+            "scoring": [s.m, s.n, s.g, s.e, s.q, s.c],
+        });
+        serde_json::to_string(&value)
+            .map_err(|e| PyValueError::new_err(format!("serialize failed: {e}")))
+    }
+
+    /// Rebuild a `Poa` from a JSON string produced by :meth:`to_json`.
+    ///
+    /// Assumes `data` was produced by `to_json` on a trusted source; malformed input may raise
+    /// or, if structurally corrupt, panic on later use.
+    #[staticmethod]
+    fn from_json(data: &str) -> PyResult<Self> {
+        #[derive(serde::Deserialize)]
+        struct State {
+            graph: Graph,
+            alignment_type: String,
+            scoring: [i8; 6],
+        }
+        let st: State = serde_json::from_str(data)
+            .map_err(|e| PyValueError::new_err(format!("deserialize failed: {e}")))?;
+        let alignment_type = parse_alignment_type(&st.alignment_type)?;
+        let inner = RsScoring::new(
+            st.scoring[0],
+            st.scoring[1],
+            st.scoring[2],
+            st.scoring[3],
+            st.scoring[4],
+            st.scoring[5],
+        )
+        .map_err(|e| PyValueError::new_err(format!("invalid scoring: {e:?}")))?;
+        let scoring = Scoring { inner };
+        Ok(Self {
+            graph: st.graph,
+            engine: SimdEngine::new(alignment_type, inner),
+            alignment_type,
+            scoring,
+        })
+    }
+
+    // ---- pickle support -------------------------------------------------------------
+    // pickle constructs the object via __new__ (default args) then calls __setstate__;
+    // __getnewargs__ supplies the (empty) positional args for __new__.
+    fn __getnewargs__(&self) -> (&'static str,) {
+        ("global",)
+    }
+
+    fn __getstate__(&self) -> PyResult<String> {
+        self.to_json()
+    }
+
+    fn __setstate__(&mut self, state: &str) -> PyResult<()> {
+        let restored = Poa::from_json(state)?;
+        *self = restored;
+        Ok(())
     }
 }
 

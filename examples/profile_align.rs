@@ -27,7 +27,7 @@ fn xorshift64(state: &mut u64) -> u64 {
     x
 }
 
-const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+const BASES: [u8; 4] = *b"ACGT";
 
 fn random_base(state: &mut u64) -> u8 {
     BASES[(xorshift64(state) % 4) as usize]

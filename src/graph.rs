@@ -8,6 +8,25 @@
 use std::collections::HashSet;
 use std::fmt;
 
+/// serde (de)serialization for the fixed `[i32; 256]` coder table. serde's built-in
+/// array impls stop at length 32, so the table is written as a length-prefixed
+/// sequence and rebuilt into the array on load (erroring if the length is wrong).
+/// Avoids pulling in `serde-big-array` for a single field.
+#[cfg(feature = "serde")]
+mod coder_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(coder: &[i32; 256], s: S) -> Result<S::Ok, S::Error> {
+        coder.as_slice().serialize(s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[i32; 256], D::Error> {
+        let v = Vec::<i32>::deserialize(d)?;
+        <[i32; 256]>::try_from(v.as_slice())
+            .map_err(|_| serde::de::Error::custom("coder table must have exactly 256 entries"))
+    }
+}
+
 /// Errors raised by [`Graph::add_alignment`] and its convenience wrappers.
 ///
 /// Mirrors the three `std::invalid_argument` throws in `spoa::Graph::AddAlignment`
@@ -37,10 +56,12 @@ impl std::error::Error for GraphError {}
 
 /// Index of a [`Node`] within [`Graph::nodes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NodeId(pub u32);
 
 /// Index of an [`Edge`] within [`Graph::edges`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EdgeId(pub u32);
 
 /// A single POA graph node: one aligned "column" position holding one coded symbol.
@@ -48,6 +69,7 @@ pub struct EdgeId(pub u32);
 /// Mirrors `spoa::Graph::Node` (`graph.hpp:40-71`), minus the `id` field (an arena `Node`'s
 /// identity is its index in [`Graph::nodes`], carried externally as a [`NodeId`]).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Node {
     /// The coded symbol (see [`Graph::coder`] / [`Graph::decoder`]) this node represents.
     pub code: u32,
@@ -112,6 +134,7 @@ impl Node {
 ///
 /// Mirrors `spoa::Graph::Edge` (`graph.hpp:72-100`).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Edge {
     /// Source node of this edge.
     pub tail: NodeId,
@@ -128,13 +151,20 @@ pub struct Edge {
 ///
 /// Mirrors `spoa::Graph` (`graph.hpp:25-320`), replacing its `unique_ptr<Node>` / raw `Node*`
 /// pointer graph with flat `Vec<Node>` / `Vec<Edge>` arenas indexed by [`NodeId`] / [`EdgeId`].
+///
+/// When the `serde` feature is enabled, `Graph` derives `Serialize`/`Deserialize` as a
+/// structural dump; deserialization trusts its input — arena indices and table lengths are
+/// not re-validated, so a malformed payload may panic when the graph is later used. Only
+/// deserialize graphs from a trusted source.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Graph {
     /// Arena of all nodes ever added to the graph, indexed by [`NodeId`].
     pub(crate) nodes: Vec<Node>,
     /// Arena of all edges ever added to the graph, indexed by [`EdgeId`].
     pub(crate) edges: Vec<Edge>,
     /// Maps a raw input byte (0-255) to its assigned code, or -1 if not yet seen.
+    #[cfg_attr(feature = "serde", serde(with = "coder_serde"))]
     pub(crate) coder: [i32; 256],
     /// Maps a code back to its raw input byte, or -1 if the code is unused.
     pub(crate) decoder: Vec<i32>,
