@@ -13,7 +13,7 @@
 // unused from any single crate's view — silence the resulting dead-code warnings here.
 #![allow(dead_code)]
 
-const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+const BASES: [u8; 4] = *b"ACGT";
 
 /// Minimal xorshift64 PRNG — reproducible, no external deps (mirrors the generator in
 /// `examples/profile_align.rs` / `tests/simd_bench.rs` so corpora are comparable).

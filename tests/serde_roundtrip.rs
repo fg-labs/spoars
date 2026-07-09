@@ -42,7 +42,7 @@ fn deserialized_graph_encodes_bases_via_restored_coder() {
     let g = build(&["ACGT", "ACGT"]);
     let json = serde_json::to_string(&g).unwrap();
     let restored: Graph = serde_json::from_str(&json).unwrap();
-    for base in [b'A', b'C', b'G', b'T'] {
+    for base in *b"ACGT" {
         assert_eq!(g.encode(base), restored.encode(base), "coder byte {base}");
     }
 }
