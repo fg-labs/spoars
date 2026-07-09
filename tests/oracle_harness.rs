@@ -52,6 +52,7 @@ fn oracle_sisd_tripwire_matches_frozen_output() {
         min_coverage: -1,
         names: None,
         subgraph: None,
+        summarize_consensus: false,
     }];
     let out = run_oracle(&cases);
     assert_eq!(out.len(), 1);

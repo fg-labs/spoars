@@ -796,6 +796,89 @@ impl Graph {
         dst
     }
 
+    /// The consensus (as [`Graph::generate_consensus_min_coverage`]) plus, for each emitted base,
+    /// the total coverage of that consensus column: the consensus node's own [`Node::coverage`]
+    /// summed with each of its aligned peers'. One entry per emitted base, so the returned `Vec`'s
+    /// length equals the consensus string's length.
+    ///
+    /// Mirrors `spoa::Graph::GenerateConsensus(min_coverage, summary*)` (`graph.cpp:388-408`): the
+    /// per-node *filter* uses the consensus node's own coverage (`>= min_coverage`, matching the
+    /// consensus string), while the emitted *value* is that node's coverage plus its aligned peers'.
+    pub fn generate_consensus_with_coverage(&mut self, min_coverage: i32) -> (String, Vec<u32>) {
+        let dst = self.generate_consensus_min_coverage(min_coverage);
+        let mut summary: Vec<u32> = Vec::new();
+        for i in 0..self.consensus.len() {
+            let node_id = self.consensus[i];
+            let node = &self.nodes[node_id.0 as usize];
+            if node.coverage(self) as i32 >= min_coverage {
+                let mut total = node.coverage(self);
+                for &aligned in &node.aligned_nodes {
+                    total += self.nodes[aligned.0 as usize].coverage(self);
+                }
+                summary.push(total);
+            }
+        }
+        (dst, summary)
+    }
+
+    /// The unfiltered consensus plus a per-column base-composition matrix. Returns
+    /// `(consensus, matrix, stride)` where `matrix` is row-major of shape
+    /// `(num_codes() + 1) × stride` and `stride == consensus.len()`: cell `code * stride + column`
+    /// counts how many sequences contribute `code` at that consensus column, and the trailing gap
+    /// row (`num_codes() * stride + column`) counts sequences that skip the column.
+    ///
+    /// Mirrors `spoa::Graph::GenerateConsensus(summary*, verbose=true)` (`graph.cpp:410-461`): the
+    /// consensus is the unfiltered one, and the matrix is filled by walking each sequence's
+    /// successor path across the MSA columns (from [`Graph::initialize_msa`]).
+    pub fn generate_consensus_with_composition(&mut self) -> (String, Vec<u32>, usize) {
+        let dst = self.generate_consensus();
+        let consensus_len = self.consensus.len();
+        let num_codes = self.num_codes as usize;
+        let mut summary = vec![0u32; (num_codes + 1) * consensus_len];
+        let (node_id_to_column, _row_size) = self.initialize_msa();
+
+        for i in 0..self.sequences.len() {
+            let mut it = self.sequences[i];
+            let mut c: usize = 0;
+            let mut p: usize = 0;
+            let mut column = node_id_to_column[it.0 as usize];
+            let mut is_gap = false;
+            loop {
+                // for (; c < consensus_.size(); ++c): advance c past consensus columns strictly
+                // left of the sequence node's column; stop at the first column >= it.
+                while c < consensus_len {
+                    let cons_col = node_id_to_column[self.consensus[c].0 as usize];
+                    if cons_col < column {
+                        c += 1;
+                        continue;
+                    }
+                    if cons_col == column {
+                        if is_gap {
+                            for j in (p + 1)..c {
+                                summary[num_codes * consensus_len + j] += 1;
+                            }
+                        }
+                        is_gap = true;
+                        p = c;
+                        let code = self.nodes[it.0 as usize].code as usize;
+                        summary[code * consensus_len + c] += 1;
+                    }
+                    break;
+                }
+                if c == consensus_len {
+                    break;
+                }
+                match self.nodes[it.0 as usize].successor(self, i as u32) {
+                    Some(next) => it = next,
+                    None => break,
+                }
+                column = node_id_to_column[it.0 as usize];
+            }
+        }
+
+        (dst, summary, consensus_len)
+    }
+
     /// Maps every node id to its multiple-sequence-alignment column, folding each node's
     /// `aligned_nodes` peers into the same column as their representative. Returns
     /// `(node_id_to_column, row_size)`, where `row_size` is the total number of distinct MSA
@@ -1809,6 +1892,20 @@ mod tests {
         g
     }
 
+    /// Build a small graph from `seqs` with global spoa-default alignment.
+    fn global_graph(seqs: &[&str]) -> Graph {
+        use crate::align::{AlignmentType, Scoring};
+        let mut g = Graph::new();
+        let mut engine =
+            crate::align::sisd::SisdEngine::new(AlignmentType::Global, Scoring::spoa_default());
+        for s in seqs {
+            let bytes = s.as_bytes();
+            let (aln, _) = engine.align(bytes, &g);
+            g.add_alignment_weight(&aln, bytes, 1).unwrap();
+        }
+        g
+    }
+
     #[test]
     fn subgraph_keeps_only_nodes_in_id_window_and_remaps() {
         let g = linear_graph_acgt();
@@ -1894,5 +1991,117 @@ mod tests {
             }
             prop_assert!(sub.is_topologically_sorted());
         }
+    }
+
+    #[test]
+    fn consensus_with_coverage_matches_consensus_len_and_sums_aligned_peers() {
+        let mut g = global_graph(&["ACGT", "ACGT", "AGGT"]);
+        let (cons, cov) = g.generate_consensus_with_coverage(-1);
+        // Summary has exactly one entry per emitted consensus base.
+        assert_eq!(cov.len(), cons.len());
+        // The unfiltered consensus equals generate_consensus().
+        assert_eq!(cons, g.generate_consensus());
+        // Every coverage entry is >= 1 (each consensus node is on >=1 sequence).
+        assert!(cov.iter().all(|&c| c >= 1));
+        // Coverage-summary length equals the filtered consensus length for any min_coverage.
+        let (cons2, cov2) = g.generate_consensus_with_coverage(2);
+        assert_eq!(cov2.len(), cons2.len());
+        assert_eq!(cons2, g.generate_consensus_min_coverage(2));
+        // min_coverage = 3 discriminates the own-vs-total filter: the divergent column's
+        // consensus node has own coverage 2 (< 3, so excluded) but total 3 (own + aligned peer).
+        // A summary that (wrongly) filtered on the total would keep an extra entry, breaking the
+        // length invariant below.
+        let (cons3, cov3) = g.generate_consensus_with_coverage(3);
+        assert_eq!(cov3.len(), cons3.len());
+        assert_eq!(cons3, g.generate_consensus_min_coverage(3));
+        // The divergent node really is excluded at min_coverage = 3 (so this case is non-trivial).
+        assert!(cons3.len() < cons.len());
+    }
+
+    #[test]
+    fn consensus_with_composition_shape_and_column_sums() {
+        let mut g = global_graph(&["ACGT", "ACGT", "AGGT"]);
+        let (cons, matrix, stride) = g.generate_consensus_with_composition();
+        // Unfiltered consensus.
+        assert_eq!(cons, g.generate_consensus());
+        assert_eq!(stride, cons.len());
+        // Shape: (num_codes + 1) rows, each `stride` wide.
+        let rows = g.num_codes() as usize + 1;
+        assert_eq!(matrix.len(), rows * stride);
+        // Invariant: per-column composition counts (all code rows + gap row) sum to the number of
+        // sequences that cover that column. With 3 fully-spanning sequences here, every column
+        // sums to 3.
+        for col in 0..stride {
+            let col_sum: u32 = (0..rows).map(|r| matrix[r * stride + col]).sum();
+            assert_eq!(
+                col_sum, 3,
+                "column {col} composition must sum to sequence count"
+            );
+        }
+    }
+
+    #[test]
+    fn consensus_with_composition_gap_row_counts_only_internal_skips() {
+        // Only sequences whose alignment *skips a column between two matched columns* land in the
+        // trailing gap row (the `(p+1)..c` loop); a sequence's unaligned prefix (before its first
+        // matched column) or suffix (after its last) is counted in no row at all. This pins that
+        // distinction, which the fully-spanning example above cannot exercise.
+        //
+        // Three strong "ACGT" copies fix the consensus at "ACGT". Then:
+        //   - "AGT" deletes the internal C: it matches col 0 (A), skips col 1 (C), matches cols 2-3
+        //     (G, T) -> one internal skip recorded in the gap row at col 1.
+        //   - "CG" covers only cols 1-2: col 0 (its prefix) and col 3 (its suffix) are unaligned and
+        //     contribute to no row, so those columns sum to fewer than the 5 sequences.
+        let mut g = global_graph(&["ACGT", "ACGT", "ACGT", "AGT", "CG"]);
+        let (cons, matrix, stride) = g.generate_consensus_with_composition();
+        assert_eq!(cons, "ACGT");
+        assert_eq!(stride, cons.len());
+        let rows = g.num_codes() as usize + 1;
+        let gap_row = g.num_codes() as usize;
+        let n = 5u32;
+
+        let col_sum = |col: usize| -> u32 { (0..rows).map(|r| matrix[r * stride + col]).sum() };
+
+        // No column ever over-counts: at most one contribution per sequence.
+        for col in 0..stride {
+            assert!(
+                col_sum(col) <= n,
+                "column {col} must not exceed sequence count"
+            );
+        }
+
+        // Internal skip: exactly the "AGT" deletion lands in the gap row at the C column (col 1),
+        // and that column is fully covered (three C codes + one C from "CG" + the one gap = 5).
+        assert_eq!(
+            matrix[gap_row * stride + 1],
+            1,
+            "internal skip must land in the gap row"
+        );
+        assert_eq!(
+            col_sum(1),
+            n,
+            "internally-skipped column stays fully covered"
+        );
+        // No other column has a gap-row entry -- prefix/suffix gaps are never counted.
+        for col in 0..stride {
+            if col != 1 {
+                assert_eq!(
+                    matrix[gap_row * stride + col],
+                    0,
+                    "column {col} must have no gap count"
+                );
+            }
+        }
+
+        // Prefix/suffix exclusion: "CG" does not reach col 0 or col 3, so neither its code row nor
+        // the gap row records it there -- those columns sum to fewer than all 5 sequences.
+        assert!(
+            col_sum(0) < n,
+            "prefix-unaligned sequence must be excluded from col 0"
+        );
+        assert!(
+            col_sum(3) < n,
+            "suffix-unaligned sequence must be excluded from col 3"
+        );
     }
 }

@@ -27,6 +27,10 @@ for read in ["ACGTACGT", "ACGTTCGT", "ACGTACGT"]:
 print(g.consensus(min_coverage=2))
 print(g.gfa())  # GFA v1
 print(g.dot())  # Graphviz DOT
+
+# Consensus with per-base total coverage, or the per-column base composition:
+consensus, coverage = g.consensus(with_coverage=True)  # (str, list[int])
+consensus, matrix = g.consensus_composition()  # rows = codes + a trailing gap row
 ```
 
 `alignment_type` is one of `"global"`, `"local"`, or `"overlap"`. `Scoring` takes

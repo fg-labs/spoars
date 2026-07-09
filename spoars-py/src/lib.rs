@@ -141,12 +141,39 @@ impl Poa {
 
     /// The consensus sequence. With `min_coverage`, nodes below that coverage are
     /// pruned from the consensus path (`generate_consensus_min_coverage`).
-    #[pyo3(signature = (min_coverage=None))]
-    fn consensus(&mut self, min_coverage: Option<i32>) -> String {
-        match min_coverage {
-            Some(min_coverage) => self.graph.generate_consensus_min_coverage(min_coverage),
-            None => self.graph.generate_consensus(),
+    /// With `with_coverage=True`, returns `(consensus, per_base_total_coverage)`
+    /// instead of a plain `str` (`generate_consensus_with_coverage`).
+    #[pyo3(signature = (min_coverage=None, with_coverage=false))]
+    fn consensus(
+        &mut self,
+        py: Python<'_>,
+        min_coverage: Option<i32>,
+        with_coverage: bool,
+    ) -> PyResult<Py<PyAny>> {
+        if with_coverage {
+            let (s, cov) = self
+                .graph
+                .generate_consensus_with_coverage(min_coverage.unwrap_or(-1));
+            Ok((s, cov).into_pyobject(py)?.into_any().unbind())
+        } else {
+            let s = match min_coverage {
+                Some(min_coverage) => self.graph.generate_consensus_min_coverage(min_coverage),
+                None => self.graph.generate_consensus(),
+            };
+            Ok(s.into_pyobject(py)?.into_any().unbind())
         }
+    }
+
+    /// The unfiltered consensus plus a per-column base-composition matrix, reshaped
+    /// from the flat Rust buffer into a nested list: `rows` = `num_codes + 1` (a
+    /// trailing gap row), each row `consensus_len` wide.
+    fn consensus_composition(&mut self) -> (String, Vec<Vec<u32>>) {
+        let (s, flat, stride) = self.graph.generate_consensus_with_composition();
+        let rows = flat.len().checked_div(stride).unwrap_or(0);
+        let matrix: Vec<Vec<u32>> = (0..rows)
+            .map(|r| flat[r * stride..(r + 1) * stride].to_vec())
+            .collect();
+        (s, matrix)
     }
 
     /// The multiple sequence alignment, one row per added sequence (optionally
