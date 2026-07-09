@@ -11,6 +11,12 @@ name: PyPI
 # `workflow_dispatch` is available for one-off manual republishes against an
 # existing tag; pick the tag in the run dialog (sets `github.ref` to that tag).
 #
+# spoars-py is a member of the spoars workspace and inherits the crate version
+# (`version.workspace = true`), and its pyproject.toml declares the version
+# `dynamic`, so maturin stamps the wheel with the released crate version
+# automatically. release-plz therefore bumps the wheel version in lockstep and
+# every release publishes a fresh version (no more "File already exists").
+#
 # PyPI authentication uses Trusted Publishing (OIDC). The PyPI project `spoars`
 # must have a configured publisher pointing at this workflow file and the `pypi`
 # environment before the first run; see CONTRIBUTING.md.
@@ -80,3 +86,5 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           packages-dir: dist/
+          # A re-run against an already-published version should no-op, not fail.
+          skip-existing: true

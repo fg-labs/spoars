@@ -1,6 +1,20 @@
+[workspace]
+# spoars-py is a workspace member so release-plz bumps its version in lockstep
+# with the crate: both inherit `[workspace.package].version` below. It is kept
+# OUT of `default-members`, and thus out of bare `cargo build`/`test`/`clippy`
+# (what CI runs — none of the `ci-*` aliases pass `--workspace`), so the
+# pure-Rust workflow never has to build the pyo3 extension. maturin builds it
+# explicitly from the spoars-py/ directory.
+members = [".", "spoars-py"]
+default-members = ["."]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.2"
+
 [package]
 name = "spoars"
-version = "0.1.2"
+version.workspace = true
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -20,6 +34,9 @@ exclude = [
     ".github/**",
     "scripts/**",
     "RELAY.md",
+    # spoars-py is a sibling workspace member (the pyo3 bindings), not part of
+    # the published `spoars` crate; keep it out of the crate tarball.
+    "spoars-py/**",
 ]
 
 [[bin]]
