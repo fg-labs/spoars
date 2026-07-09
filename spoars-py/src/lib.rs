@@ -345,6 +345,136 @@ impl Poa {
         *self = restored;
         Ok(())
     }
+
+    // ---- Scalar + per-node graph accessors ------------------------------------------
+
+    /// Number of distinct symbol codes assigned so far.
+    fn num_codes(&self) -> u32 {
+        self.graph.num_codes()
+    }
+
+    /// The code assigned to a single-character base (e.g. ``"A"``), or ``None`` if unseen.
+    fn encode(&self, base: &str) -> PyResult<Option<u32>> {
+        let bytes = base.as_bytes();
+        if bytes.len() != 1 {
+            return Err(PyValueError::new_err(
+                "base must be a single ASCII character",
+            ));
+        }
+        Ok(self.graph.encode(bytes[0]))
+    }
+
+    /// The 1-character base a code represents, or ``None`` if the code is unused.
+    fn decode(&self, code: u32) -> Option<String> {
+        self.graph.decode(code).map(|b| (b as char).to_string())
+    }
+
+    /// Node ids in topological order.
+    fn rank_order(&self) -> Vec<u32> {
+        self.graph.rank_order().iter().map(|n| n.0).collect()
+    }
+
+    /// For each added sequence (in order), the id of its first node.
+    fn sequence_starts(&self) -> Vec<u32> {
+        self.graph.sequence_starts().iter().map(|n| n.0).collect()
+    }
+
+    /// The node ids sequence ``seq_index`` traverses, in order.
+    fn sequence_path(&self, seq_index: usize) -> PyResult<Vec<u32>> {
+        if seq_index >= self.graph.sequence_starts().len() {
+            return Err(PyValueError::new_err(format!(
+                "seq_index ({seq_index}) must be < num_sequences ({})",
+                self.graph.sequence_starts().len()
+            )));
+        }
+        Ok(self
+            .graph
+            .sequence_path(seq_index)
+            .iter()
+            .map(|n| n.0)
+            .collect())
+    }
+
+    /// The node ids of the most recently generated consensus path (empty if none yet).
+    fn consensus_nodes(&self) -> Vec<u32> {
+        self.graph.consensus_nodes().iter().map(|n| n.0).collect()
+    }
+
+    /// The coded symbol at ``node_id``.
+    fn node_code(&self, node_id: u32) -> PyResult<u32> {
+        self.check_node(node_id)?;
+        Ok(self.graph.node(NodeId(node_id)).code)
+    }
+
+    /// Number of distinct input sequences passing through ``node_id``.
+    fn node_coverage(&self, node_id: u32) -> PyResult<u32> {
+        self.check_node(node_id)?;
+        Ok(self.graph.node(NodeId(node_id)).coverage(&self.graph))
+    }
+
+    /// The 1-character base ``node_id`` represents, or ``None``.
+    fn node_base(&self, node_id: u32) -> PyResult<Option<String>> {
+        self.check_node(node_id)?;
+        Ok(self
+            .graph
+            .node(NodeId(node_id))
+            .base(&self.graph)
+            .map(|b| (b as char).to_string()))
+    }
+
+    /// The next node id sequence ``label`` visits after ``node_id``, or ``None`` if it ends there.
+    fn node_successor(&self, node_id: u32, label: u32) -> PyResult<Option<u32>> {
+        self.check_node(node_id)?;
+        Ok(self
+            .graph
+            .node(NodeId(node_id))
+            .successor(&self.graph, label)
+            .map(|n| n.0))
+    }
+
+    /// The distinct sequence-index labels passing through ``node_id``, sorted.
+    fn node_labels(&self, node_id: u32) -> PyResult<Vec<u32>> {
+        self.check_node(node_id)?;
+        Ok(self.graph.node(NodeId(node_id)).labels(&self.graph))
+    }
+
+    // ---- Edge + MSA-column accessors --------------------------------------------------
+
+    /// Every edge as ``(tail, head, weight)``, in edge-arena order.
+    fn edges(&self) -> Vec<(u32, u32, i64)> {
+        self.graph
+            .edges()
+            .iter()
+            .map(|e| (e.tail.0, e.head.0, e.weight))
+            .collect()
+    }
+
+    /// For each node id, the MSA column it occupies, plus the total column count.
+    fn msa_columns(&self) -> (Vec<u32>, u32) {
+        self.graph.msa_columns()
+    }
+
+    /// One entry per MSA column: the ``(sequence_index, node_id)`` pairs in that column.
+    fn column_members(&self) -> Vec<Vec<(u32, u32)>> {
+        self.graph
+            .column_members()
+            .into_iter()
+            .map(|col| col.into_iter().map(|(seq, node)| (seq, node.0)).collect())
+            .collect()
+    }
+}
+
+impl Poa {
+    /// Guard that `node_id` is in range, else a Python `ValueError`.
+    fn check_node(&self, node_id: u32) -> PyResult<()> {
+        if (node_id as usize) >= self.graph.num_nodes() {
+            return Err(PyValueError::new_err(format!(
+                "node id ({node_id}) must be < num_nodes ({})",
+                self.graph.num_nodes()
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Build a POA graph from `sequences` in one call and return the [`Poa`].
