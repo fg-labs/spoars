@@ -4,7 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "spoars"
-version = "0.1.0"
+# Sourced from the crate version (workspace-inherited) by maturin, so the wheel
+# tracks the `spoars` release version automatically — no manual bump needed.
+dynamic = ["version"]
 requires-python = ">=3.10"
 description = "Python bindings for spoars — partial order alignment consensus and MSA"
 license = { text = "MIT" }

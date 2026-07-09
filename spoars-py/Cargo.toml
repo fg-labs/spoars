@@ -1,11 +1,11 @@
-# Standalone crate (its own `[workspace]`) so the parent spoars package's
-# `cargo` commands never pull it in; it is built only via maturin and linted
-# separately in the Python CI workflow.
-[workspace]
-
+# Member of the parent spoars workspace (see the root Cargo.toml `[workspace]`),
+# kept out of `default-members` so the parent's `cargo` commands never build it;
+# it is built only via maturin and linted separately in the Python CI workflow.
+# Inheriting `version.workspace` keeps it in lockstep with the `spoars` crate so
+# release-plz bumps both together.
 [package]
 name = "spoars-py"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 authors = ["Nils Homer <nils@fulcrumgenomics.com>"]
