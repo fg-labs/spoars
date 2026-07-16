@@ -3,6 +3,7 @@
 [![CI](https://github.com/fg-labs/spoars/actions/workflows/check.yml/badge.svg)](https://github.com/fg-labs/spoars/actions/workflows/check.yml)
 [![crates.io](https://img.shields.io/crates/v/spoars.svg)](https://crates.io/crates/spoars)
 [![PyPI](https://img.shields.io/pypi/v/spoars.svg)](https://pypi.org/project/spoars/)
+[![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](http://bioconda.github.io/recipes/spoars/README.html)
 [![docs.rs](https://docs.rs/spoars/badge.svg)](https://docs.rs/spoars)
 [![codecov](https://codecov.io/gh/fg-labs/spoars/branch/main/graph/badge.svg)](https://codecov.io/gh/fg-labs/spoars)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
