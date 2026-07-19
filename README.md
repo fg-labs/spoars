@@ -7,6 +7,7 @@
 [![docs.rs](https://docs.rs/spoars/badge.svg)](https://docs.rs/spoars)
 [![codecov](https://codecov.io/gh/fg-labs/spoars/branch/main/graph/badge.svg)](https://codecov.io/gh/fg-labs/spoars)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21445784.svg)](https://doi.org/10.5281/zenodo.21445784)
 
 A faithful, memory-safe, SIMD-accelerated native-Rust reimplementation of [spoa](https://github.com/rvaser/spoa) — the C++ partial order alignment (POA) library for consensus generation and multiple sequence alignment.
 
