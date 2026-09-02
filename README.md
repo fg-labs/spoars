@@ -109,7 +109,33 @@ You can also implement `AlignmentEngine` yourself — for a different scoring mo
 
 ## Inspecting the graph
 
-Beyond building and summarizing the graph, `Graph` exposes read-only accessors so downstream code can walk the DAG directly: `nodes()` / `edges()` and their `node()` / `edge()` id lookups, `num_nodes()` / `num_edges()`, `encode()` / `decode()` to convert between raw bytes and internal symbol codes, and `rank_order()` / `sequence_starts()` / `consensus_nodes()` for traversal. `Node` carries `coverage()`, `successor()`, and `base()` helpers.
+Beyond building and summarizing the graph, `Graph` exposes read-only accessors so downstream code can walk the DAG directly: `nodes()` / `edges()` and their `node()` / `edge()` id lookups, `num_nodes()` / `num_edges()`, `encode()` / `decode()` to convert between raw bytes and internal symbol codes, and `rank_order()` / `sequence_starts()` / `consensus_nodes()` for traversal. `Node` carries `coverage()`, `successor()`, `base()`, and the deduplicated adjacency helpers `successors()` / `predecessors()` (parallel edges collapse to one neighbor).
+
+## Superbubbles
+
+`Graph::superbubbles()` detects superbubbles — single-entry, single-exit bubbles that capture local alignment ambiguities (substitutions, small indels) — in near-linear time (`O(E + V log V)`) with the Brankovic et al. (2016) algorithm. The DAG is augmented with a virtual super-source and super-sink so bubbles bounded by the graph's head (multiple start nodes) or tail (multiple end nodes) are still reported, via the `SuperbubbleEnd::{Source, Node, Sink}` boundary type. Output is raw — one smallest superbubble per entrance, including the degenerate adjacent-boundary pairs — so callers apply whatever domain filtering they need (for example mapping boundaries to MSA columns with `msa_columns()` and dropping empty-interior pairs).
+
+Unlike the alignment/consensus engine, superbubble detection has no counterpart in spoa, so it is **not** covered by the bit-for-bit C++ parity claim above; it is validated in-crate against an independent brute-force superbubble oracle (property test).
+
+```rust
+use spoars::graph::Graph;
+use spoars::superbubble::SuperbubbleEnd;
+
+fn count_interior_bubbles(graph: &Graph) -> usize {
+    graph
+        .superbubbles()
+        .into_iter()
+        .filter(|bubble| {
+            // An interior bubble is bounded by two real nodes; a boundary touching the virtual
+            // Source/Sink is a head/tail bubble.
+            matches!(
+                (bubble.entry, bubble.exit),
+                (SuperbubbleEnd::Node(_entry), SuperbubbleEnd::Node(_exit))
+            )
+        })
+        .count()
+}
+```
 
 ## Faithfulness and testing
 

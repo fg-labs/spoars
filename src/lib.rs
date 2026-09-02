@@ -70,6 +70,9 @@
 //!   built DAG.
 //! - [`align`] — [`align::AlignmentType`], [`align::GapMode`], validated [`align::Scoring`], the
 //!   [`align::AlignmentEngine`] trait, and the scalar/SIMD engines.
+//! - [`superbubble`] — superbubble detection over the built DAG ([`graph::Graph::superbubbles`],
+//!   [`superbubble::Superbubble`], [`superbubble::SuperbubbleEnd`]).
 
 pub mod align;
 pub mod graph;
+pub mod superbubble;
