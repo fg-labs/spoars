@@ -128,6 +128,46 @@ impl Node {
     pub fn base(&self, graph: &Graph) -> Option<u8> {
         graph.decode(self.code)
     }
+
+    /// The deduplicated successor node ids of this node — the [`Edge::head`] of each of its
+    /// out-edges, with parallel edges (multiple edges to the same head) collapsed to a single
+    /// entry. Successors are returned in out-edge insertion order (first occurrence wins).
+    ///
+    /// This is *all* neighbors, for graph-structure traversal; contrast [`Node::successor`], which
+    /// follows a single sequence by returning the one neighbor reached by a given `label`.
+    #[must_use]
+    pub fn successors(&self, graph: &Graph) -> Vec<NodeId> {
+        // Linear `contains` dedup, not a HashSet: `add_edge` already folds repeated `(tail, head)`
+        // pairs, so on a normally-constructed graph the out-edges already have distinct heads and
+        // this scan removes nothing. It is O(k²) in the out-degree k; POA out-degree is small in
+        // practice (it grows with the number of divergent sequences, not — as a bound — with the
+        // alphabet), so the scan beats allocating and hashing a set and matches the dense-`usize`
+        // dedup used elsewhere in the crate.
+        let mut successors: Vec<NodeId> = Vec::with_capacity(self.outedges.len());
+        for &edge_id in &self.outedges {
+            let head = graph.edges[edge_id.0 as usize].head;
+            if !successors.contains(&head) {
+                successors.push(head);
+            }
+        }
+        successors
+    }
+
+    /// The deduplicated predecessor node ids of this node — the [`Edge::tail`] of each of its
+    /// in-edges, with parallel edges (multiple edges from the same tail) collapsed to a single
+    /// entry. Predecessors are returned in in-edge insertion order (first occurrence wins).
+    #[must_use]
+    pub fn predecessors(&self, graph: &Graph) -> Vec<NodeId> {
+        // Linear `contains` dedup for the same reason as [`Node::successors`] — see it.
+        let mut predecessors: Vec<NodeId> = Vec::with_capacity(self.inedges.len());
+        for &edge_id in &self.inedges {
+            let tail = graph.edges[edge_id.0 as usize].tail;
+            if !predecessors.contains(&tail) {
+                predecessors.push(tail);
+            }
+        }
+        predecessors
+    }
 }
 
 /// A directed edge between two POA graph nodes, tagged with the sequences that traverse it.
@@ -727,7 +767,11 @@ impl Graph {
     /// only if the node itself is not ignored — unfinished aligned nodes are pushed (and marked
     /// ignored). This exact push order is load-bearing: it determines the resulting rank order,
     /// which later tasks' DP indexing and consensus tie-breaking depend on matching byte-for-byte.
-    fn topological_sort(&mut self) {
+    ///
+    /// `pub(crate)` (rather than private) only so the sibling `superbubble` module's `#[cfg(test)]`
+    /// fixtures can re-sort after wiring arbitrary topologies directly into the arena; production
+    /// callers are all in-module (`add_alignment`, `subgraph`).
+    pub(crate) fn topological_sort(&mut self) {
         self.rank_to_node.clear();
 
         let mut marks = vec![0u8; self.nodes.len()];
