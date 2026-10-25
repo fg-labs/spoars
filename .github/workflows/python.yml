@@ -30,7 +30,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: spoars-py
       # spoars-py is its own workspace, so the check.yml fmt/lint jobs (which run
@@ -40,7 +40,7 @@ jobs:
         run: cargo fmt -- --check
       - name: Clippy (Rust)
         run: cargo clippy --all-targets -- -D warnings
-      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
         with:
           pixi-version: v0.71.0
           manifest-path: spoars-py/pixi.toml
